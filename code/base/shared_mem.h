@@ -58,7 +58,7 @@ typedef struct
    u32 alarmTime;
    u32 uLoopCounter;
    u32 uLoopCounter1;
-   u32 uLoopCounter2;
+   u32 uLoopCounter2;   // x64 player: live appsrc backlog (ms) = GS keep-up signal for adaptive video
    u32 uLoopCounter3;
    u32 uLoopCounter4;
    u32 uLoopCounter5;
