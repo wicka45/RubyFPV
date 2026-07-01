@@ -70,6 +70,7 @@ static int s_bFullscreen = 0;     // windowed: current _NET_WM_STATE_FULLSCREEN 
 static int s_iWinW = 0, s_iWinH = 0;              // current on-screen window size (updated on resize)
 static int s_iPendingWinW = 0, s_iPendingWinH = 0; // resize requested by the pump (keyboard thread)
 static int s_iRenderW = 0, s_iRenderH = 0;        // fixed render size: OSD + composited video drawn at this
+static int s_bAutoRenderRes = 0;                  // console: auto-match render res to the stream (min(stream,panel)); off when RUBY_WINDOW_W/H forced
 static uint8_t* s_pWinBuf[2] = { NULL, NULL };    // render buffers (ARGB32) that RenderEngineCairo draws into
 static cairo_surface_t* s_pImgSurf[2] = { NULL, NULL }; // cairo image surfaces wrapping those buffers
 static Visual* s_pXVisual = NULL;
@@ -428,8 +429,14 @@ static int _ruby_drm_gl_init(int iModeW, int iModeH)
    // battery knob), else the panel mode. When they differ the present letterboxes + GPU-upscales render->panel.
    s_iDrmModeW = iModeW; s_iDrmModeH = iModeH;
    int iRenderW = iModeW, iRenderH = iModeH;
-   { const char* e = getenv("RUBY_WINDOW_W"); if ( (NULL != e) && (atoi(e) > 0) ) iRenderW = atoi(e); }
-   { const char* e = getenv("RUBY_WINDOW_H"); if ( (NULL != e) && (atoi(e) > 0) ) iRenderH = atoi(e); }
+   int bEnvW = 0, bEnvH = 0;
+   { const char* e = getenv("RUBY_WINDOW_W"); if ( (NULL != e) && (atoi(e) > 0) ) { iRenderW = atoi(e); bEnvW = 1; } }
+   { const char* e = getenv("RUBY_WINDOW_H"); if ( (NULL != e) && (atoi(e) > 0) ) { iRenderH = atoi(e); bEnvH = 1; } }
+   // Auto render-res: when the size is NOT forced via env, start at the panel mode and later shrink to fit the
+   // live stream (see ruby_drm_core_auto_render_poll/apply) -> composite fewer OSD pixels for a sub-panel stream.
+   // Forcing both RUBY_WINDOW_W and _H keeps a fixed manual size (no auto-resize).
+   s_bAutoRenderRes = (bEnvW && bEnvH) ? 0 : 1;
+   if ( s_bAutoRenderRes ) { iRenderW = iModeW; iRenderH = iModeH; }
    s_iRenderW = iRenderW; s_iRenderH = iRenderH;
    // RenderEngineCairo draws at the display-attributes size -> it MUST match the draw buffers (the render res),
    // not the panel scanout, or the OSD renders at the wrong stride into a smaller buffer (garbled screen).
@@ -499,6 +506,67 @@ static void _ruby_gl_upload_video()
       glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, iTexW, (int)h, GL_RGBA, GL_UNSIGNED_BYTE, pv->data);
    __sync_synchronize();
    if ( pv->uSeq == uSeq ) { s_uVidLastSeq = uSeq; s_iVidSrcW = (int)w; s_iVidSrcH = (int)h; }  // not torn during upload
+}
+
+// --- Auto render-res matching (console GL path) --------------------------------------------------
+// In auto mode, the OSD/composite canvas tracks the live stream fitted within the panel: never larger
+// than the panel, never upscaled beyond the stream. This composites fewer OSD pixels when the stream is
+// smaller than the panel; when the stream is >= the panel it settles at the panel size. The GBM scanout
+// (panel mode) is never touched -> no DRM modeset, no flicker. The actual buffer swap is driven by the
+// app (ruby_central) between frames so it can also recreate the cairo surfaces + reload fonts.
+int ruby_drm_core_auto_render_poll(int* pW, int* pH)
+{
+   if ( ! s_bAutoRenderRes ) return 0;
+   if ( ! s_bDrmGL ) return 0;                                   // console GL path only
+   if ( (s_iVidSrcW <= 0) || (s_iVidSrcH <= 0) ) return 0;       // no stream yet -> stay at panel
+   int panelW = s_iDrmModeW, panelH = s_iDrmModeH;
+   double s = 1.0;                                               // fit stream within panel, never upscaling the canvas
+   if ( (double)s_iVidSrcW * s > (double)panelW ) s = (double)panelW / (double)s_iVidSrcW;
+   if ( (double)s_iVidSrcH * s > (double)panelH ) s = (double)panelH / (double)s_iVidSrcH;
+   int w = (int)((double)s_iVidSrcW * s + 0.5);
+   int h = (int)((double)s_iVidSrcH * s + 0.5);
+   w &= ~1; h &= ~1;                                             // keep even
+   if ( w < 320 ) w = 320;
+   if ( h < 240 ) h = 240;
+   if ( w > panelW ) w = panelW;
+   if ( h > panelH ) h = panelH;
+   int dw = (w > s_iRenderW) ? (w - s_iRenderW) : (s_iRenderW - w);
+   int dh = (h > s_iRenderH) ? (h - s_iRenderH) : (s_iRenderH - h);
+   if ( (dw <= 4) && (dh <= 4) ) return 0;                       // hysteresis: ignore sub-pixel churn
+   if ( NULL != pW ) *pW = w;
+   if ( NULL != pH ) *pH = h;
+   return 1;
+}
+
+// Reallocate the console render buffers + OSD texture to a new render res. Render thread, between frames.
+// Returns 0 on success. Caller MUST then recreate the RenderEngine cairo surfaces (they point at the freed
+// buffers) and reload fonts before the next startFrame.
+int ruby_drm_core_apply_render_res(int iW, int iH)
+{
+   if ( ! s_bDrmGL ) return -1;
+   if ( (iW < 320) || (iH < 240) || (iW > s_iDrmModeW) || (iH > s_iDrmModeH) ) return -1;
+   if ( (iW == s_iRenderW) && (iH == s_iRenderH) ) return 0;
+   int iStride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, iW);
+   uint8_t* pNew[2] = { NULL, NULL };
+   for( int i=0; i<2; i++ )
+   {
+      pNew[i] = (uint8_t*) calloc(1, (size_t)iStride * iH);
+      if ( NULL == pNew[i] ) { if ( NULL != pNew[0] ) free(pNew[0]); log_softerror_and_alarm("[DRMCore] render-res resize alloc failed"); return -1; }
+   }
+   for( int i=0; i<2; i++ ) { if ( NULL != s_pWinBuf[i] ) free(s_pWinBuf[i]); s_pWinBuf[i] = pNew[i]; }
+   s_iRenderW = iW; s_iRenderH = iH;
+   s_iGLTexW = iStride / 4;
+   s_DRMDisplayAttributes.iWidth = iW; s_DRMDisplayAttributes.iHeight = iH;
+   for( int i=0; i<2; i++ )
+   {
+      s_DRMRuntimeState.drawBuffers[i].uWidth = (uint32_t)iW; s_DRMRuntimeState.drawBuffers[i].uHeight = (uint32_t)iH;
+      s_DRMRuntimeState.drawBuffers[i].uStride = (uint32_t)iStride; s_DRMRuntimeState.drawBuffers[i].uSize = (uint32_t)iStride * (uint32_t)iH;
+      s_DRMRuntimeState.drawBuffers[i].pData = s_pWinBuf[i];   // uBufferId (1/2) kept -> RenderEngine surface-id match still holds
+   }
+   glBindTexture(GL_TEXTURE_2D, s_glTex);                      // grow the OSD texture to the new render size
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, s_iGLTexW, iH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+   log_softerror_and_alarm("[DRMCore] render-res auto-matched to %dx%d (scanout %dx%d)", iW, iH, s_iDrmModeW, s_iDrmModeH);
+   return 0;
 }
 
 static void _ruby_drm_gl_present()

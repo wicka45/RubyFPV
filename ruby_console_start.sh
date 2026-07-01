@@ -11,11 +11,13 @@ cd /opt/rubyfpv || exit 1
 [ -e /opt/rubyfpv/config/no_drm_gl ] && export RUBY_DRM_GL=0
 [ -n "${RUBY_DRM_GL:-}" ] && export RUBY_DRM_GL
 
-# Internal render resolution (per-host CPU/battery knob): OSD + video composite at this size, the GPU upscales
-# to the panel (letterboxed if the aspect differs, e.g. 1080p 16:9 on a 2880x1800 16:10 panel). woody = 1080p.
-# Unset -> render at the native panel mode. Lower on weaker laptops (e.g. 1280 720).
-export RUBY_WINDOW_W=1920
-export RUBY_WINDOW_H=1080
+# Internal OSD/composite render resolution. LEFT UNSET -> AUTO: the console GS starts at the panel mode, then
+# auto-matches the live stream (fit within the panel) so a sub-panel stream composites fewer OSD pixels (saves
+# CPU/heat/battery); a stream >= the panel settles at panel res. The GPU upscales render->panel (letterboxed if
+# the aspect differs). Set BOTH to FORCE a fixed size and disable auto (e.g. a very weak GPU):
+#   export RUBY_WINDOW_W=1280; export RUBY_WINDOW_H=720
+#export RUBY_WINDOW_W=1920
+#export RUBY_WINDOW_H=1080
 
 # --- Intelligently pick the RubyFPV radio NIC by CHIPSET (not a hardcoded name) ---------------------
 # RubyFPV only supports a few injection chipsets (rtl8812au/8814au/8811au/8821au, ath9k_htc, mt76xx).

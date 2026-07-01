@@ -57,6 +57,7 @@ class RenderEngine
      float getPixelWidth();
      float getPixelHeight();
      virtual void* getDrawContext();
+     virtual void resizeToDisplayBuffers() {}   // x64: rebind to resized drm_core draw buffers after a render-res change (no-op otherwise)
 
      float setGlobalAlfa(float alfa);
      float getGlobalAlfa();

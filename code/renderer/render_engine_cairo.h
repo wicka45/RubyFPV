@@ -10,7 +10,8 @@ class RenderEngineCairo: public RenderEngine
      virtual ~RenderEngineCairo();
 
      virtual void* getDrawContext();
-     virtual void setStroke(const double* color, float fStrokeSize); 
+     virtual void resizeToDisplayBuffers();
+     virtual void setStroke(const double* color, float fStrokeSize);
      virtual void setStrokeSize(float fStrokeSize);
 
      virtual void setFontOutlineColor(u32 idFont, u8 r, u8 g, u8 b, u8 a);

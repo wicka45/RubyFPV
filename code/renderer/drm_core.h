@@ -89,6 +89,11 @@ int ruby_drm_core_is_gpu_composite();
 int ruby_drm_core_poll_key(int* pCode, int* pPressed);
 int ruby_drm_core_get_fd();
 
+// x64 console render-res auto-matching (defined only on x64): poll returns 1 (+ target WxH) when the OSD/
+// composite canvas should resize to fit the current stream; apply reallocs the render buffers. Render thread.
+int ruby_drm_core_auto_render_poll(int* pW, int* pH);
+int ruby_drm_core_apply_render_res(int iW, int iH);
+
 type_drm_display_attributes* ruby_drm_get_main_display_info();
 
 type_drm_buffer* ruby_drm_core_get_main_draw_buffer();

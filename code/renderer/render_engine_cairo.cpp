@@ -120,6 +120,34 @@ void* RenderEngineCairo::getDrawContext()
    return m_pCairoCtx;
 }
 
+void RenderEngineCairo::resizeToDisplayBuffers()
+{
+   // Render-res auto-match (x64 console): drm_core reallocated the draw buffers at a new size. Our cached
+   // cairo surfaces point at the freed buffers -> rebind them and update the logical render dimensions.
+   type_drm_display_attributes* pDisplayInfo = ruby_drm_get_main_display_info();
+   m_iRenderWidth = pDisplayInfo->iWidth;
+   m_iRenderHeight = pDisplayInfo->iHeight;
+   m_fPixelWidth = 1.0/(float)m_iRenderWidth;
+   m_fPixelHeight = 1.0/(float)m_iRenderHeight;
+
+   if ( NULL != m_pCairoCtx ) { cairo_destroy(m_pCairoCtx); m_pCairoCtx = NULL; }
+   if ( NULL != m_pMainCairoSurface[0] ) { cairo_surface_destroy(m_pMainCairoSurface[0]); m_pMainCairoSurface[0] = NULL; }
+   if ( NULL != m_pMainCairoSurface[1] ) { cairo_surface_destroy(m_pMainCairoSurface[1]); m_pMainCairoSurface[1] = NULL; }
+
+   type_drm_buffer* pMainDisplayBuffer = ruby_drm_core_get_main_draw_buffer();
+   type_drm_buffer* pBackDisplayBuffer = ruby_drm_core_get_back_draw_buffer();
+   m_uRenderDrawSurfacesIds[0] = pMainDisplayBuffer->uBufferId;
+   m_uRenderDrawSurfacesIds[1] = pBackDisplayBuffer->uBufferId;
+   m_pMainCairoSurface[0] = cairo_image_surface_create_for_data(pMainDisplayBuffer->pData, CAIRO_FORMAT_ARGB32,
+       pMainDisplayBuffer->uWidth, pMainDisplayBuffer->uHeight, pMainDisplayBuffer->uStride);
+   m_pMainCairoSurface[1] = cairo_image_surface_create_for_data(pBackDisplayBuffer->pData, CAIRO_FORMAT_ARGB32,
+       pBackDisplayBuffer->uWidth, pBackDisplayBuffer->uHeight, pBackDisplayBuffer->uStride);
+   if ( (NULL == m_pMainCairoSurface[0]) || (NULL == m_pMainCairoSurface[1]) )
+      log_softerror_and_alarm("[RenderEngineCairo] resizeToDisplayBuffers: failed to recreate cairo surfaces.");
+   else
+      log_line("[RenderEngineCairo] Rebound to resized draw buffers: %d x %d", m_iRenderWidth, m_iRenderHeight);
+}
+
 
 void RenderEngineCairo::startFrame()
 {

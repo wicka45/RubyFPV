@@ -834,6 +834,26 @@ void render_all_with_menus(u32 timeNow, bool bRenderMenus, bool bForceBackground
 {
    Preferences* p = get_Preferences();
 
+#if defined(HW_PLATFORM_X64)
+   // Render-res auto-match: before drawing this frame, if the console compositor wants a different OSD/composite
+   // canvas size to fit the current stream, resize the drm_core buffers, rebind the cairo surfaces, and reload
+   // fonts for the new height. Runs on this (render) thread between frames -> no torn frame. No-op when the size
+   // is forced via RUBY_WINDOW_W/H, when no stream is up yet, or when already matched.
+   {
+      int nrW = 0, nrH = 0;
+      if ( ruby_drm_core_auto_render_poll(&nrW, &nrH) )
+      if ( 0 == ruby_drm_core_apply_render_res(nrW, nrH) )
+      {
+         g_pRenderEngine->resizeToDisplayBuffers();   // rebind cairo surfaces to the reallocated draw buffers
+         // No font reload here: OSD fonts are sized from the panel/HDMI height (same as the existing static
+         // RUBY_WINDOW_W/H knob, which already decouples render res from font height), so the canvas can resize
+         // without re-rasterizing fonts. loadAllFonts() would free+reload fonts with new ids and orphan any
+         // cached font id -> avoided.
+         log_line("[Central] Auto-matched OSD render res to %dx%d for the live stream.", nrW, nrH);
+      }
+   }
+#endif
+
    if ( g_pControllerSettings->iFreezeOSD && s_bFreezeOSD )
       return;
 
