@@ -753,10 +753,16 @@ int _radio_rx_parse_received_wifi_radio_data(int iInterfaceIndex, int iMaxReads)
 
       if ( iBufferLength <= 0 )
       {
-         log_softerror_and_alarm("[RadioRxThread] Rx cap returned an empty buffer (%d length) on radio interface index %d.", iBufferLength, iInterfaceIndex+1);
+         // A runt or foreign frame (shorter than its own radiotap+IEEE headers) yields a negative
+         // payload length here. On platforms with the kernel BPF Ruby-frame filter such frames never
+         // reach userspace; on x64 (BPF filter skipped) they do. A single malformed frame must NOT
+         // mark the entire interface as broken hardware - that triggers an endless radio reinit loop
+         // (RADIO_INTERFACE_DOWN -> reinit -> wlan bounce -> vehicle drops offline). Treat it as a
+         // bad packet and skip it, mirroring the CRC-failure path below. Genuine hardware failure is
+         // still caught by the poll() error path (which marks the interface broken).
+         log_softerror_and_alarm("[RadioRxThread] Rx cap returned an empty/invalid buffer (%d length) on radio interface index %d. Skipping frame.", iBufferLength, iInterfaceIndex+1);
          iDataIsOk = 0;
-         iReturn = -1;
-         break;
+         continue;
       }
 
       iCountParsed++;

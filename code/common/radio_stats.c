@@ -450,6 +450,11 @@ void radio_stats_reset_interfaces_rx_info(shared_mem_radio_stats* pSMRS, const c
       pSMRS->radio_interfaces[i].totalRxPacketsLost = 0;
       pSMRS->radio_interfaces[i].rxPacketsPerSec = 0;
       pSMRS->radio_interfaces[i].timeLastRxPacket = 0;
+      // Must also forget the last radio-link packet index (like radio_stats_reset / _reset_received_info do),
+      // otherwise the next packet is compared against a stale index across this discontinuity and produces a
+      // bogus huge "lost" count. This reset runs on every radio-link negotiation step, so leaving it stale
+      // made every negotiation test measure ~0% quality -> negotiation always failed -> video stayed gated.
+      pSMRS->radio_interfaces[i].lastReceivedRadioLinkPacketIndex = MAX_U32;
 
       pSMRS->radio_interfaces[i].tmpRxBytes = 0;
       pSMRS->radio_interfaces[i].tmpRxPackets = 0;
@@ -1103,22 +1108,39 @@ int radio_stats_update_on_new_radio_packet_received(shared_mem_radio_stats* pSMR
       else
       {
          t_packet_header* pPH = (t_packet_header*)pPacketBuffer;
-         
-         if ( 0 != pPH->radio_link_packet_index )
-         if ( pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex != MAX_U32 )
-         if ( pPH->radio_link_packet_index > pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex + 1 )
-         {
-            u32 uLost = pPH->radio_link_packet_index - pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex - 1;
-            //log_line("DBG lost %d packets, gap is %u ms wide, radio pkt %d", uLost, uTimeGap, pPH->radio_link_packet_index);
-            if ( (pPH->packet_flags & PACKET_FLAGS_MASK_MODULE) == PACKET_COMPONENT_VIDEO )
-               pSMRS->radio_interfaces[iInterfaceIndex].hist_tmp_rxPacketsLostCountVideo += uLost;
-            else
-               pSMRS->radio_interfaces[iInterfaceIndex].hist_tmp_rxPacketsLostCountData += uLost;
-            pSMRS->radio_interfaces[iInterfaceIndex].totalRxPacketsLost += uLost;
-            s_uControllerLinkStats_tmpRecvLost[iInterfaceIndex] += uLost;
-         }
 
-         pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex = pPH->radio_link_packet_index;
+         // radio_link_packet_index is an independent monotonic sequence per SOURCE radio link. The lost
+         // count is tracked per radio interface, but on x64 the monitor interface also captures our own
+         // injected uplink (self-TX echo) and any other controller/vehicle sharing the channel. Those have
+         // a different vehicle_id_src and an unrelated index, so comparing across sources produced bogus
+         // huge "lost" counts (100k+), which made radio-link negotiation always measure ~0% quality and
+         // fail -> video output stayed gated. Only compute loss between consecutive packets from the SAME
+         // source on this interface; on a source change, just resync the index.
+         static u32 s_uLastRxVehicleIdPerInterface[MAX_RADIO_INTERFACES] = {0};
+         if ( (iInterfaceIndex >= 0) && (iInterfaceIndex < MAX_RADIO_INTERFACES) &&
+              (pPH->vehicle_id_src != s_uLastRxVehicleIdPerInterface[iInterfaceIndex]) )
+         {
+            s_uLastRxVehicleIdPerInterface[iInterfaceIndex] = pPH->vehicle_id_src;
+            pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex = pPH->radio_link_packet_index;
+         }
+         else
+         {
+            if ( 0 != pPH->radio_link_packet_index )
+            if ( pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex != MAX_U32 )
+            if ( pPH->radio_link_packet_index > pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex + 1 )
+            {
+               u32 uLost = pPH->radio_link_packet_index - pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex - 1;
+               //log_line("DBG lost %d packets, gap is %u ms wide, radio pkt %d", uLost, uTimeGap, pPH->radio_link_packet_index);
+               if ( (pPH->packet_flags & PACKET_FLAGS_MASK_MODULE) == PACKET_COMPONENT_VIDEO )
+                  pSMRS->radio_interfaces[iInterfaceIndex].hist_tmp_rxPacketsLostCountVideo += uLost;
+               else
+                  pSMRS->radio_interfaces[iInterfaceIndex].hist_tmp_rxPacketsLostCountData += uLost;
+               pSMRS->radio_interfaces[iInterfaceIndex].totalRxPacketsLost += uLost;
+               s_uControllerLinkStats_tmpRecvLost[iInterfaceIndex] += uLost;
+            }
+
+            pSMRS->radio_interfaces[iInterfaceIndex].lastReceivedRadioLinkPacketIndex = pPH->radio_link_packet_index;
+         }
       }
    }
    // End - Update history and good/bad/lost packets for interface 
