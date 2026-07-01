@@ -39,7 +39,7 @@
 #include "render_engine_raw.h"
 #endif
 
-#if defined (HW_PLATFORM_RADXA)
+#if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 #include "render_engine_cairo.h"
 #endif
 
@@ -58,7 +58,7 @@ RenderEngine* render_init_engine()
       s_bRenderEngineSupportsRawFonts = true;
       s_pRenderEngine = new RenderEngineRaw();
       #endif
-      #if defined (HW_PLATFORM_RADXA)
+      #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64) || defined(HW_PLATFORM_X64)
       s_bRenderEngineSupportsRawFonts = true;
       s_pRenderEngine = new RenderEngineCairo();
       #endif
@@ -515,7 +515,7 @@ int RenderEngine::loadRawFont(int iFamilyId, const char* szFontFile, int iBold)
 
    log_line("[RenderEngineRaw] Loading font: %s", szFile);
    m_pRawFonts[m_iCountRawFonts]->pImageObject = _loadRawFontImageObject(szFile);
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    #else
    if ( NULL == m_pRawFonts[m_iCountRawFonts]->pImageObject )
    {

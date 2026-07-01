@@ -76,6 +76,17 @@ int ruby_drm_core_wait_for_display_connected();
 
 int ruby_drm_core_init(int iPlaneIndex, uint32_t uFormat, int iWidth, int iHeight, int iRefreshRate);
 int ruby_drm_core_uninit();
+
+// x64 windowed (X11/XWayland) output: ruby_drm_core_init() auto-dispatches here when DISPLAY/WAYLAND_DISPLAY
+// is set (unless RUBY_FORCE_DRM). Callable directly too. window_closed() reports a window-manager close.
+int ruby_drm_core_init_windowed(int iWidth, int iHeight);
+int ruby_drm_core_is_windowed();
+int ruby_drm_core_window_closed();
+// x64 console (EGL-on-GBM) two-texture GPU composite is active: ruby_central skips its software video->OSD
+// blit (renders OSD-only/transparent) and drm_core blends the decoded video under it on the GPU.
+int ruby_drm_core_is_gpu_composite();
+// Windowed input: drain one queued window key event (evdev keycode + pressed flag). 1 if dequeued.
+int ruby_drm_core_poll_key(int* pCode, int* pPressed);
 int ruby_drm_core_get_fd();
 
 type_drm_display_attributes* ruby_drm_get_main_display_info();
@@ -94,6 +105,11 @@ int ruby_drm_set_object_property(type_drm_object_info* pObject, const char *szNa
 
 void ruby_drm_set_video_source_size(int iWidth, int iHeight);
 void ruby_drm_enable_vsync(int iEnableVSync);
+
+// x64: additive video plane shown below the OSD (fed with decoded BGRx/XRGB frames).
+int ruby_drm_video_plane_init(int iSrcW, int iSrcH);
+int ruby_drm_video_plane_present(const uint8_t* pData, int iW, int iH, int iStride);
+void ruby_drm_video_plane_uninit();
 
 #ifdef __cplusplus
 }  

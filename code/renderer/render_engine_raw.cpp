@@ -884,10 +884,19 @@ void RenderEngineRaw::drawRect(float xPos, float yPos, float fWidth, float fHeig
 
    if ( m_ColorFill[3] > 2 )
    {
+#if defined(HW_PLATFORM_X64)
+      // x64 software-composites the live video into this OSD buffer EVERY frame; a per-pixel alpha rect
+      // blend (fbg_recta) over a large menu panel drags the live-feed fps (risking a stall). Use the
+      // fast opaque 32-bit fill (fbg_rect = a tight, vectorizable store loop, no read/blend) -> boxes
+      // are solid instead of translucent (acceptable here) but fill at ~memcpy speed. Text/icons still
+      // alpha-blend normally.
+      fbg_rect(m_pFBG, x,y, w,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
+#else
       if ( m_bEnableAlphaBlending )
          fbg_recta(m_pFBG, x,y, w,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
       else
          fbg_rect(m_pFBG, x,y, w,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
+#endif
    }
    if ( (m_ColorStroke[0] != m_ColorFill[0]) ||
         (m_ColorStroke[1] != m_ColorFill[1]) ||
@@ -949,10 +958,16 @@ void RenderEngineRaw::drawRoundRect(float xPos, float yPos, float fWidth, float 
 
    if ( m_ColorFill[3] > 2 )
    {
+#if defined(HW_PLATFORM_X64)
+      // x64: fast opaque fill (see drawRect note) so menu/box backgrounds don't drag the composited
+      // live video. Solid instead of translucent; corner vlines below are tiny so left as-is.
+      fbg_rect(m_pFBG, x+3,y, w-5,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
+#else
       if ( m_bEnableAlphaBlending )
          fbg_recta(m_pFBG, x+3,y, w-5,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
       else
          fbg_rect(m_pFBG, x+3,y, w-5,h, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);
+#endif
    }
 
    fbg_vline(m_pFBG, x+2,y+1, h-2, m_ColorFill[0], m_ColorFill[1], m_ColorFill[2], m_ColorFill[3]);

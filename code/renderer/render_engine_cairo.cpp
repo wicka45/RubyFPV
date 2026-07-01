@@ -844,6 +844,17 @@ void RenderEngineCairo::bltIcon(float xPosDest, float yPosDest, int iSrcX, int i
 inline void RenderEngineCairo::_blend_pixel(unsigned char* pixel, unsigned char r, unsigned char g, unsigned char b, unsigned char a)
 {
    // Output surface format order is: BGRA
+   // Fully opaque source (e.g. OSD transparency set to "none"): no blend math needed - just write the
+   // color. This is what lets the user trade the per-pixel compositing cost for battery/heat by
+   // turning OSD transparency off, without disabling alpha support for translucent elements.
+   if ( a >= 255 )
+   {
+      *pixel = b;
+      *(pixel+1) = g;
+      *(pixel+2) = r;
+      *(pixel+3) = 255;
+      return;
+   }
    if ( *(pixel+3) == 0 )
    {
       *pixel = b;
@@ -882,6 +893,20 @@ void RenderEngineCairo::_draw_hline(int x, int y, int w, unsigned char r, unsign
 {
    type_drm_buffer* pOutputBufferInfo = ruby_drm_core_get_back_draw_buffer();
    u8* pDestLine = (&(pOutputBufferInfo->pData[0])) + y*pOutputBufferInfo->uStride + 4*x;
+#if defined(HW_PLATFORM_X64)
+   // x64 software composite: blend over the video in this buffer so OSD lines / rounded-panel edges
+   // honor transparency (self-gating via destination alpha, see _blend_pixel). Fully opaque (a>=255,
+   // e.g. transparency "none") falls through to the fast write loop below.
+   if ( m_bEnableAlphaBlending && (a < 255) )
+   {
+      for( int i=0; i<w; i++ )
+      {
+         _blend_pixel(pDestLine, r,g,b,a);
+         pDestLine += 4;
+      }
+      return;
+   }
+#endif
    for( int i=0; i<w; i++ )
    {
       *pDestLine++ = b;
@@ -895,6 +920,17 @@ void RenderEngineCairo::_draw_vline(int x, int y, int h, unsigned char r, unsign
 {
    type_drm_buffer* pOutputBufferInfo = ruby_drm_core_get_back_draw_buffer();
    u8* pDestLine = (&(pOutputBufferInfo->pData[0])) + y*pOutputBufferInfo->uStride + 4*x;
+#if defined(HW_PLATFORM_X64)
+   if ( m_bEnableAlphaBlending && (a < 255) )
+   {
+      for( int i=0; i<h; i++ )
+      {
+         _blend_pixel(pDestLine, r,g,b,a);
+         pDestLine += pOutputBufferInfo->uStride;
+      }
+      return;
+   }
+#endif
    for( int i=0; i<h; i++ )
    {
       *pDestLine++ = b;
@@ -1181,7 +1217,16 @@ void RenderEngineCairo::drawRoundRect(float xPos, float yPos, float fWidth, floa
       {
          u8* pDestLine = (u8*)&(pOutputBufferInfo->pData[(ySt+y)*pOutputBufferInfo->uStride]);
          pDestLine += 4*(xSt+3);
+#if defined(HW_PLATFORM_X64)
+         // x64 software composite: blend the rounded-rect background over the video painted into
+         // this same buffer so the OSD background-transparency setting works. Self-gating via the
+         // destination alpha (see _blend_pixel): opaque-black over non-video (alpha 0) areas,
+         // alpha-blended over video (alpha 0xFF). On HW-overlay platforms the opaque write below is
+         // kept - there the hardware compositor does the OSD-over-video alpha blend.
+         if ( m_bEnableAlphaBlending && (a < 255) )
+#else
          if ( false && m_bEnableAlphaBlending )
+#endif
          {
             for( int x=0; x<(w-5); x++ )
             {
@@ -1191,12 +1236,13 @@ void RenderEngineCairo::drawRoundRect(float xPos, float yPos, float fWidth, floa
          }
          else
          {
-            for( int x=0; x<(w-5); x++ )
             {
-               *pDestLine++ = b;
-               *pDestLine++ = g;
-               *pDestLine++ = r;
-               *pDestLine++ = a;
+               // One 32-bit store per pixel instead of four byte stores (vectorizable) - this is the
+               // hot path for opaque menu/panel backgrounds (drawRoundRect / drawRoundRectMenu).
+               u32 uFillC = (((u32)a)<<24) | (((u32)r)<<16) | (((u32)g)<<8) | ((u32)b);
+               u32* pDest32 = (u32*)pDestLine;
+               for( int x=0; x<(w-5); x++ )
+                  *pDest32++ = uFillC;
             }
          }
       }
@@ -1290,7 +1336,16 @@ void RenderEngineCairo::drawRoundRectMenu(float xPos, float yPos, float fWidth, 
          u8* pDestLine = (u8*)&(pOutputBufferInfo->pData[(ySt+y)*pOutputBufferInfo->uStride]);
          pDestLine += 4*(xSt+3);
        
+#if defined(HW_PLATFORM_X64)
+         // x64 software composite: blend the rounded-rect background over the video painted into
+         // this same buffer so the OSD background-transparency setting works. Self-gating via the
+         // destination alpha (see _blend_pixel): opaque-black over non-video (alpha 0) areas,
+         // alpha-blended over video (alpha 0xFF). On HW-overlay platforms the opaque write below is
+         // kept - there the hardware compositor does the OSD-over-video alpha blend.
+         if ( m_bEnableAlphaBlending && (a < 255) )
+#else
          if ( false && m_bEnableAlphaBlending )
+#endif
          {
             for( int x=0; x<(w-5); x++ )
             {
@@ -1300,12 +1355,13 @@ void RenderEngineCairo::drawRoundRectMenu(float xPos, float yPos, float fWidth, 
          }
          else
          {
-            for( int x=0; x<(w-5); x++ )
             {
-               *pDestLine++ = b;
-               *pDestLine++ = g;
-               *pDestLine++ = r;
-               *pDestLine++ = a;
+               // One 32-bit store per pixel instead of four byte stores (vectorizable) - this is the
+               // hot path for opaque menu/panel backgrounds (drawRoundRect / drawRoundRectMenu).
+               u32 uFillC = (((u32)a)<<24) | (((u32)r)<<16) | (((u32)g)<<8) | ((u32)b);
+               u32* pDest32 = (u32*)pDestLine;
+               for( int x=0; x<(w-5); x++ )
+                  *pDest32++ = uFillC;
             }          
          }
       }
