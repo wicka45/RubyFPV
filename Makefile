@@ -16,6 +16,22 @@ _CPPFLAGS := $(_CPPFLAGS) -DRUBY_BUILD_HW_PLATFORM_OPENIPC
 _CPPFLAGS_NOSDL := $(_CPPFLAGS)
 _LDFLAGS_NOSDL := $(_LDFLAGS)
 else
+ifeq ($(RUBY_BUILD_ENV),x64)
+
+LDFLAGS_CENTRAL := -lpthread -lrt -lm
+LDFLAGS_CENTRAL2 := -lpthread -lrt -lm
+
+LDFLAGS_RENDERER := -ldrm -lcairo -lX11 -lXext -lEGL -lGLESv2 -lgbm
+CFLAGS_RENDERER := -I/usr/include/drm -I/usr/include/libdrm
+CFLAGS_RENDERER += -I/usr/include/cairo
+_LDFLAGS := $(LDFLAGS) -lrt -lpcap -lpthread -Wl,--gc-sections
+_CFLAGS := $(_CFLAGS) -DRUBY_BUILD_HW_PLATFORM_X64 -std=gnu11 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+_CPPFLAGS := $(_CPPFLAGS) -DRUBY_BUILD_HW_PLATFORM_X64 -include cstdint -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+_CPPFLAGS_NOSDL := $(_CPPFLAGS)
+_LDFLAGS_NOSDL := $(_LDFLAGS)
+CENTRAL_RENDER_CODE := $(FOLDER_CENTRAL_RENDERER)/render_engine.o $(FOLDER_CENTRAL_RENDERER)/render_engine_cairo.o $(FOLDER_CENTRAL_RENDERER)/render_engine_ui.o $(FOLDER_CENTRAL_RENDERER)/drm_core.o
+MODULE_LOC := $(FOLDER_COMMON)/strings_loc.o $(FOLDER_COMMON)/strings_table.o
+else
 ifeq ($(RUBY_BUILD_ENV),radxa)
 
 LDFLAGS_CENTRAL := -L/lib/aarch64-linux-gnu -lpthread -lrt -lm
@@ -51,6 +67,7 @@ _LDFLAGS_NOSDL := $(_LDFLAGS)
 
 CENTRAL_RENDER_CODE := $(FOLDER_CENTRAL_RENDERER)/lodepng.o $(FOLDER_CENTRAL_RENDERER)/nanojpeg.o $(FOLDER_CENTRAL_RENDERER)/fbgraphics.o $(FOLDER_CENTRAL_RENDERER)/render_engine.o $(FOLDER_CENTRAL_RENDERER)/render_engine_raw.o $(FOLDER_CENTRAL_RENDERER)/render_engine_ui.o $(FOLDER_CENTRAL_RENDERER)/fbg_dispmanx.o
 
+endif
 endif
 endif
 
@@ -216,6 +233,8 @@ vehicle: ruby_start ruby_utils ruby_tx_telemetry ruby_rt_vehicle
 
 ifeq ($(RUBY_BUILD_ENV),radxa)
 station: ruby_start ruby_utils ruby_controller ruby_rt_station ruby_tx_rc ruby_rx_telemetry ruby_player_radxa
+else ifeq ($(RUBY_BUILD_ENV),x64)
+station: ruby_start ruby_utils ruby_controller ruby_rt_station ruby_tx_rc ruby_rx_telemetry ruby_player_x64
 else
 station: ruby_start ruby_utils ruby_controller ruby_rt_station ruby_tx_rc ruby_rx_telemetry
 endif
@@ -298,6 +317,13 @@ ruby_plugin_gauge_heading: $(FOLDER_PLUGINS_OSD)/ruby_plugin_gauge_heading.o osd
 
 ruby_player_radxa:code/r_player/ruby_player_radxa.o code/r_player/mpp_core.o $(FOLDER_BASE)/hdmi.o $(FOLDER_BASE)/ctrl_settings.o $(FOLDER_BASE)/shared_mem.o $(FOLDER_BASE)/parser_h264.o $(CENTRAL_RENDER_CODE) $(MODULE_MINIMUM_BASE) $(MODULE_MINIMUM_COMMON)
 	$(CXX) $(_CPPFLAGS) $(CFLAGS_RENDERER) -o $@ $^ $(_LDFLAGS) $(LDFLAGS_RENDERER) $(LDFLAGS_CENTRAL) $(LDFLAGS_CENTRAL2) -ldl -lc -lrockchip_mpp
+
+# Special compile rule: ruby_player_x64.o needs GStreamer headers (overrides generic r_player pattern rule)
+code/r_player/ruby_player_x64.o: code/r_player/ruby_player_x64.cpp
+	$(CXX) $(_CFLAGS) -I/usr/include/gstreamer-1.0 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -c -o $@ $<
+
+ruby_player_x64:code/r_player/ruby_player_x64.o $(FOLDER_BASE)/ctrl_settings.o $(FOLDER_BASE)/shared_mem.o $(MODULE_MINIMUM_BASE)
+	$(CXX) $(_CFLAGS) -I/usr/include/gstreamer-1.0 -I/usr/include/glib-2.0 -I/usr/lib/x86_64-linux-gnu/glib-2.0/include -I/usr/include/sysprof-6 -pthread -o $@ $^ $(_LDFLAGS) -lgstapp-1.0 -lgstbase-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lrt -lpthread
 
 ifeq ($(RUBY_BUILD_ENV),radxa)
 tests: test_port_rx test_port_tx test_link
