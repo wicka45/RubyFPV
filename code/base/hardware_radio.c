@@ -841,9 +841,13 @@ int _hardware_enumerate_wifi_radios()
       
       if ( 0 == sRadioInfo[s_iHwRadiosCount].szName[0] )
          continue;
+#if !defined(HW_PLATFORM_X64)
+      // x64: accept the system-given predictable name "wlx<MAC>" (no udev rename to wlanN needed) --
+      // the check below already admits both wlan* and wlx*. Pi/Radxa keep requiring wlanN naming.
       if ( 0 != strstr(sRadioInfo[s_iHwRadiosCount].szName, "wlx") )
          continue;
-        
+#endif
+
       log_line("[HW-R] Parsing found wireless radio: [%s]", sRadioInfo[s_iHwRadiosCount].szName);
       if ( 0 == strstr(sRadioInfo[s_iHwRadiosCount].szName, "wlan" ) )
       if ( 0 == strstr(sRadioInfo[s_iHwRadiosCount].szName, "wlx" ) )
@@ -1155,6 +1159,30 @@ int _hardware_enumerate_wifi_radios()
          log_line("[HW-R] Radio interface %d (%s) was set as %s", i+1, sRadioInfo[i].szName, str_get_radio_card_model_string(sRadioInfo[i].iCardModel));
       }
    }
+
+   // x64/whitelist: drop wifi radio interfaces whose chipset is not Ruby-supported, so Ruby
+   // only ever uses whitelisted adapters (e.g. the Alfa rtl8812au). The built-in Broadcom 'wl'
+   // adapter stays loaded for OS internet but is no longer offered to Ruby as a radio -> stops
+   // the bogus "radio interface N failed to initialize" + "invalid data over the radio link"
+   // alarms on x64 desktops that have an unsupported onboard wifi card.
+   {
+      int iKept = 0;
+      for( int i=0; i<s_iHwRadiosCount; i++ )
+      {
+         if ( (0 == sRadioInfo[i].isSupported) && (0 == sRadioInfo[i].isSerialRadio) )
+         {
+            log_line("[HW-R] Whitelist: ignoring radio interface [%s] (driver [%s]): not a Ruby-capable chipset.", sRadioInfo[i].szName, sRadioInfo[i].szDriver);
+            continue;
+         }
+         if ( iKept != i )
+            memcpy(&sRadioInfo[iKept], &sRadioInfo[i], sizeof(radio_hw_info_t));
+         iKept++;
+      }
+      if ( iKept != s_iHwRadiosCount )
+         log_line("[HW-R] Whitelist: kept %d Ruby-capable radio interface(s) of %d detected.", iKept, s_iHwRadiosCount);
+      s_iHwRadiosCount = iKept;
+   }
+
    return 1;
 }
 
@@ -1239,6 +1267,10 @@ int hardware_radio_get_class_net_adapters_count()
    {
       if ( NULL != strstr(szToken, "wlan") )
          iCount++;
+#if defined(HW_PLATFORM_X64)
+      else if ( NULL != strstr(szToken, "wlx") )   // count predictable system wireless names on x64
+         iCount++;
+#endif
       szToken = strtok(NULL, "*");
    }
    return iCount;

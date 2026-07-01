@@ -71,6 +71,10 @@ int s_iTokenPositionToCheck = 0;
 char s_szAudioToken[24];
 
 bool s_bAudioPlayerStarted = false;
+#if defined(HW_PLATFORM_X64)
+u32  s_uTimeToStartAudioPlayerX64 = 0;   // when to (re)check starting deferred live audio; 0 = not pending
+u32  s_uAudioFirstInitMs = 0;            // first audio-init time = boot anchor for the deferred start
+#endif
 pthread_t s_ThreadAudioBuffering;
 bool s_bThreadAudioBufferingStarted = false;
 bool s_bStopThreadAudioBuffering = false;
@@ -445,6 +449,19 @@ void start_audio_player_and_pipe()
    sprintf(szComm, "aplay -q -N -R 10000 -c 1 --rate 44100 --format S16_LE %s", FIFO_RUBY_AUDIO1);
    if ( g_pCurrentModel->isRunningOnOpenIPCHardware() )
       sprintf(szComm, "aplay -q -N -R 10000 -c 1 --rate 8000 --format S16_BE %s", FIFO_RUBY_AUDIO1);
+   #if defined(HW_PLATFORM_X64)
+   // Force the autodetected hardware device so aplay does not inherit the PipeWire "default" PCM,
+   // which a root/tty1 process with no PipeWire session cannot reach.
+   {
+      const char* szAudioDev = hardware_audio_get_playback_device();
+      if ( (NULL != szAudioDev) && (0 != szAudioDev[0]) )
+      {
+         snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q -D %s -N -R 10000 -c 1 --rate 44100 --format S16_LE %s", szAudioDev, FIFO_RUBY_AUDIO1);
+         if ( g_pCurrentModel->isRunningOnOpenIPCHardware() )
+            snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q -D %s -N -R 10000 -c 1 --rate 8000 --format S16_BE %s", szAudioDev, FIFO_RUBY_AUDIO1);
+      }
+   }
+   #endif
    #if defined(HW_PLATFORM_RADXA)
    char szDevice[64];
    szDevice[0] = 0;
@@ -539,7 +556,24 @@ void init_processing_audio()
    {
       log_line("[AudioRx] Init: current EC scheme: %d/%d, packet length: %d bytes", s_iAudioDataPacketsPerBlock, s_iAudioECPacketsPerBlock, s_iAudioPacketSize);
       s_bHasAudioOutputDevice = true;
+#if defined(HW_PLATFORM_X64)
+      // The startup intro jingle (ruby_central plays res/intro1.wav, ~8s) holds the SAME exclusive
+      // plughw device, so the live FPV audio would cut it off. During the boot window, defer the live
+      // audio; periodic_loop_audio then waits for the jingle's aplay to actually finish before starting
+      // (non-blocking, capped). Later re-inits (well past boot) start immediately. Robust to init/uninit
+      // cycles because the window is anchored to the first init, not a one-shot flag.
+      if ( 0 == s_uAudioFirstInitMs )
+         s_uAudioFirstInitMs = g_TimeNow;
+      if ( g_TimeNow < s_uAudioFirstInitMs + 3000 )
+      {
+         s_uTimeToStartAudioPlayerX64 = s_uAudioFirstInitMs + 3000;
+         log_line("[AudioRx] x64: deferring live-audio start until the startup jingle finishes.");
+      }
+      else
+         start_audio_player_and_pipe();
+#else
       start_audio_player_and_pipe();
+#endif
    }
    else
       log_softerror_and_alarm("[AudioRx] No output audio devices/soundcards on the controller. Audio output is disabled.");
@@ -553,6 +587,9 @@ void uninit_processing_audio()
    if ( s_bHasAudioOutputDevice )
       stop_audio_player_and_pipe();
 
+#if defined(HW_PLATFORM_X64)
+   s_uTimeToStartAudioPlayerX64 = 0;   // cancel any pending deferred start
+#endif
    s_bAudioProcessingStarted = false;
 
    log_line("[AudioRx] Uninit audio processing complete.");
@@ -751,6 +788,23 @@ void periodic_loop_audio()
    if ( g_TimeNow < s_uLastTimePeriodicLoopAudio + 50 )
       return;
    s_uLastTimePeriodicLoopAudio = g_TimeNow;
+
+#if defined(HW_PLATFORM_X64)
+   // Deferred live-audio start: wait for the startup jingle's aplay to finish (it holds the exclusive
+   // plughw device), THEN start. Before we start, the only aplay running is the jingle, so the check is
+   // unambiguous. Capped ~15s from first init so drone audio is never blocked indefinitely.
+   if ( (0 != s_uTimeToStartAudioPlayerX64) && (g_TimeNow >= s_uTimeToStartAudioPlayerX64) )
+   {
+      if ( hw_process_exists("aplay") && (g_TimeNow < s_uAudioFirstInitMs + 15000) )
+         s_uTimeToStartAudioPlayerX64 = g_TimeNow + 400;   // jingle still playing -> recheck shortly
+      else
+      {
+         s_uTimeToStartAudioPlayerX64 = 0;
+         if ( s_bAudioProcessingStarted && s_bHasAudioOutputDevice && (! s_bAudioPlayerStarted) )
+            start_audio_player_and_pipe();
+      }
+   }
+#endif
 
    /*
    if ( 0 != s_uLastTimeRecvAudioPacket )

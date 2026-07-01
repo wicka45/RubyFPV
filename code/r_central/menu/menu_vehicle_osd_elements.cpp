@@ -579,6 +579,7 @@ void MenuVehicleOSDElements::valuesToUI()
    if ( -1 != m_IndexRCRSSI )
       m_pItemsSelect[34]->setSelection((g_pCurrentModel->osd_params.osd_flags2[iScreenIndex] & OSD_FLAG2_SHOW_RC_RSSI)?1:0);
 
+
    m_pItemsSelect[30]->setSelection(p->iShowControllerCPUInfo);
    if ( hardware_i2c_has_current_sensor() )
    {

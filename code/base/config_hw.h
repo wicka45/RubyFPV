@@ -5,6 +5,8 @@
 
 #if defined(RUBY_BUILD_HW_PLATFORM_OPENIPC)
 #define HW_PLATFORM_OPENIPC_CAMERA
+#elif defined(RUBY_BUILD_HW_PLATFORM_X64)
+#define HW_PLATFORM_X64
 #elif defined(RUBY_BUILD_HW_PLATFORM_RADXA)
 #define HW_PLATFORM_RADXA
 #else
@@ -24,7 +26,9 @@
 #ifndef HW_PLATFORM_LINUX_GENERIC
 #ifndef HW_PLATFORM_RASPBERRY
 #ifndef HW_PLATFORM_RADXA
+#ifndef HW_PLATFORM_X64
 #error "NO HARDWARE PLATFORM DEFINED!"
+#endif
 #endif
 #endif
 #endif

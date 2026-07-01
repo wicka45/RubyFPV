@@ -179,6 +179,48 @@
 
 #endif
 
+
+#if defined(HW_PLATFORM_X64)
+
+// x64 GS install prefix. Override at build time with -DRUBY_PREFIX='"/your/path"'; default is the
+// system location /opt/rubyfpv. All x64 install paths are composed from it (string-literal concat),
+// so relocating the GS is a one-line change (or a build flag) instead of editing every path.
+#ifndef RUBY_PREFIX
+#define RUBY_PREFIX "/opt/rubyfpv"
+#endif
+
+#define FOLDER_BINARIES RUBY_PREFIX "/"
+#define FOLDER_DRIVERS RUBY_PREFIX "/drivers/"
+#define FOLDER_CONFIG RUBY_PREFIX "/config/"
+#define FOLDER_CONFIG_MODELS RUBY_PREFIX "/config/models/"
+#define FOLDER_VEHICLE_HISTORY RUBY_PREFIX "/config/models/history-%d/"
+#define FOLDER_LOGS RUBY_PREFIX "/logs/"
+#define FOLDER_MEDIA RUBY_PREFIX "/media/"
+#define FOLDER_MEDIA_VEHICLE_DATA RUBY_PREFIX "/media/vehicle-%u/"
+#define FOLDER_RESOURCES RUBY_PREFIX "/res/"
+#define FOLDER_OSD_PLUGINS RUBY_PREFIX "/plugins/osd/"
+#define FOLDER_CORE_PLUGINS RUBY_PREFIX "/plugins/core/"
+#define FOLDER_UPDATES RUBY_PREFIX "/updates/"
+#define FOLDER_RUBY_TEMP RUBY_PREFIX "/tmp/"
+#define FOLDER_USB_MOUNT RUBY_PREFIX "/tmp/tmpusbfiles/"
+#define FOLDER_TEMP_VIDEO_MEM RUBY_PREFIX "/tmp/memdisk/"
+#define FOLDER_WINDOWS_PARTITION "/config/"
+#define FOLDER_CALIBRATION_FILES RUBY_PREFIX "/cal/"
+
+#define FILE_FORCE_VEHICLE "/config/forcevehicle"
+#define FILE_FORCE_VEHICLE_NO_CAMERA "/config/force_no_camera"
+#define FILE_FORCE_CONTROLLER "/config/forcecontroller"
+#define FILE_FORCE_ROUTER "/config/forcerouter"
+#define FILE_FORCE_RESET "/config/forcereset"
+#define FILE_BOOT_LOG_STEPS "/config/bootstepslog.txt"
+
+#define VIDEO_PLAYER_PIPE "ruby_player_x64"
+#define VIDEO_PLAYER_SM "ruby_player_x64"
+#define VIDEO_PLAYER_UDP "ruby_player_x64"
+#define VIDEO_PLAYER_OFFLINE "ruby_player_x64"
+
+#endif
+
 // -------------------------------------------------------------------------------
 
 

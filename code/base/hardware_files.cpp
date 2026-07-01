@@ -153,6 +153,11 @@ int hardware_get_free_space_kb()
    if ( 1 != hw_execute_bash_command_raw("df / | grep dev/", szOutput) )
       return -1;
    #endif
+   #if defined(HW_PLATFORM_X64)
+   // x64 GS: no SD card; root lives on the host drive (e.g. the MacBook's). Report rootfs free space.
+   if ( 1 != hw_execute_bash_command_raw("df / | grep dev/", szOutput) )
+      return -1;
+   #endif
    #if defined(HW_PLATFORM_OPENIPC_CAMERA)
    //if ( 1 != hw_execute_bash_command_raw("df . | grep overlay 2>/dev/null", szOutput) )
    //   return -1;
@@ -220,7 +225,10 @@ int hardware_try_mount_usb()
       sprintf(szCommand, "rm -rf %s*", FOLDER_USB_MOUNT); 
       hw_execute_bash_command(szCommand, NULL);
    }
-   hw_execute_bash_command_raw("lsblk -l -n -o NAME | grep sd 2>&1", szOutput);
+   // x64/Mac: the OS disk is /dev/sda (not a USB like on a Pi), so the old "first sdX<digit>"
+   // logic grabbed sda1 = /boot/efi (full) -> copy failed. Select a REMOVABLE (RM=1), UNMOUNTED
+   // partition (the USB stick) instead, never the OS disk or a mounted system partition.
+   hw_execute_bash_command_raw("lsblk -ln -o NAME,RM,TYPE,MOUNTPOINT | awk '$3==\"part\" && $2==\"1\" && ($4==\"\"||$4==\"-\"){print $1}' 2>&1", szOutput);
    if ( 0 == szOutput[0] )
    {
       log_softerror_and_alarm("[Hardware] USB memory stick could NOT be mounted! Failed to iterate block devices.");

@@ -38,7 +38,7 @@
 #include "hardware_procs.h"
 #include "flags.h"
 
-#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA)
+#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 
 ControllerSettings s_CtrlSettings;
 int s_CtrlSettingsLoaded = 0;
@@ -122,7 +122,11 @@ void reset_ControllerSettings()
 
    s_CtrlSettings.iRadioTxUsesPPCAP = DEFAULT_USE_PPCAP_FOR_TX;
    s_CtrlSettings.iRadioBypassSocketBuffers = DEFAULT_BYPASS_SOCKET_BUFFERS;
+   #if defined(HW_PLATFORM_X64)
+   s_CtrlSettings.iStreamerOutputMode = 0;
+#else
    s_CtrlSettings.iStreamerOutputMode = 1;
+#endif
    s_CtrlSettings.iVideoMPPBuffersSize = DEFAULT_MPP_BUFFERS_SIZE;
    s_CtrlSettings.iHDMIVSync = 1;
    s_CtrlSettings.iEasterEgg1 = 0;
@@ -328,7 +332,11 @@ int load_ControllerSettings()
 
    if ( 1 != fscanf(fd, "%d", &s_CtrlSettings.iStreamerOutputMode) )
       { log_softerror_and_alarm("Load ctrl settings, failed on line 26");
-        s_CtrlSettings.iStreamerOutputMode = 1;
+        #if defined(HW_PLATFORM_X64)
+   s_CtrlSettings.iStreamerOutputMode = 0;
+#else
+   s_CtrlSettings.iStreamerOutputMode = 1;
+#endif
       }
    if ( 1 != fscanf(fd, "%d", &s_CtrlSettings.iVideoMPPBuffersSize) )
       { log_softerror_and_alarm("Load ctrl settings, failed on line 27");
@@ -387,7 +395,11 @@ int load_ControllerSettings()
    // Validate settings
 
    if ( (s_CtrlSettings.iStreamerOutputMode < 0) || (s_CtrlSettings.iStreamerOutputMode > 2) )
-      s_CtrlSettings.iStreamerOutputMode = 1;
+      #if defined(HW_PLATFORM_X64)
+   s_CtrlSettings.iStreamerOutputMode = 0;
+#else
+   s_CtrlSettings.iStreamerOutputMode = 1;
+#endif
 
    if ( (s_CtrlSettings.iVideoMPPBuffersSize < 5) || (s_CtrlSettings.iVideoMPPBuffersSize > 128) )
       s_CtrlSettings.iVideoMPPBuffersSize = DEFAULT_MPP_BUFFERS_SIZE;

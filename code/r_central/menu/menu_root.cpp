@@ -114,6 +114,16 @@ void MenuRoot::addItems()
    m_iIndexMedia = addMenuItem(new MenuItem(L("Media & Storage"), L("Manage saved logs, screenshots and videos.")));
    
    m_pMenuItems[m_ItemsCount-1]->setExtraHeight(m_sfMenuPaddingY);
+
+   // On x64 ground stations (a regular PC/laptop) offer a direct "Exit to shell" on the top-level
+   // menu (otherwise it's only in the developer menu). Embedded platforms boot straight into Ruby.
+   m_iIndexExitShell = -1;
+#if defined(HW_PLATFORM_X64)
+   addSeparator();
+   m_iIndexExitShell = addMenuItem(new MenuItem(L("Exit to shell"), L("Close Ruby and exit to the Linux shell/console.")));
+   m_pMenuItems[m_ItemsCount-1]->setExtraHeight(m_sfMenuPaddingY);
+#endif
+
    char szBuff[256];
    char szBuff2[64];
    getSystemVersionString(szBuff2, (SYSTEM_SW_VERSION_MAJOR<<8) | SYSTEM_SW_VERSION_MINOR);
@@ -339,6 +349,13 @@ void MenuRoot::onSelectItem()
    Menu::onSelectItem();
    if ( (-1 == m_SelectedIndex) || (m_pMenuItems[m_SelectedIndex]->isEditing()) )
       return;
+
+   if ( (-1 != m_iIndexExitShell) && (m_iIndexExitShell == m_SelectedIndex) )
+   {
+      pairing_stop();
+      g_bQuit = true;
+      return;
+   }
 
    if ( m_iIndexSimpleSetup == m_SelectedIndex )
    {

@@ -31,6 +31,7 @@
 */
 
 #include <sys/ioctl.h>
+#include <fcntl.h>
 #include <netpacket/packet.h>
 #include <net/if.h>
 #include <netinet/ether.h>
@@ -55,7 +56,11 @@
 //#define DEBUG_PACKET_SENT
 
 int s_bRadioDebugFlag = 0;
+#if defined(HW_PLATFORM_X64)
+int s_iUsePCAPForTx = 1;
+#else
 int s_iUsePCAPForTx = DEFAULT_USE_PPCAP_FOR_TX;
+#endif
 int s_iBypassSocketBuffers = DEFAULT_BYPASS_SOCKET_BUFFERS;
 int s_iRadioInterfacesBroken = 0;
 int s_iRadioLastReadErrorCode = RADIO_READ_ERROR_NO_ERROR;
@@ -286,11 +291,17 @@ int  radio_get_link_clock_delta()
 
 void radio_set_use_pcap_for_tx(int iEnablePCAPTx)
 {
+#if defined(HW_PLATFORM_X64)
+   (void)iEnablePCAPTx;
+   s_iUsePCAPForTx = 1;
+   log_line("[Radio] x64: libpcap inject for TX (AF_PACKET disabled)");
+#else
    s_iUsePCAPForTx = iEnablePCAPTx;
    if ( s_iUsePCAPForTx )
       log_line("[Radio] Set using ppcap for radio tx");
    else
       log_line("[Radio] Set using sockets for radio tx");
+#endif
 }
 
 void radio_set_bypass_socket_buffers(int iBypass)
@@ -550,6 +561,25 @@ int radio_get_last_read_error_code()
    return s_iRadioLastReadErrorCode; 
 }
 
+#if defined(HW_PLATFORM_X64)
+static u32 s_uX64RxPcapCalls = 0;
+static u32 s_uX64RxPcapHits = 0;
+static u32 s_uX64RxRadiotapFail = 0;
+static u32 s_uX64RxOk = 0;
+static u32 s_uX64RxForeignDrop = 0;
+static u32 s_uX64RxLastLogMs = 0;
+
+void radio_reset_x64_rx_debug_stats()
+{
+   s_uX64RxPcapCalls = 0;
+   s_uX64RxPcapHits = 0;
+   s_uX64RxRadiotapFail = 0;
+   s_uX64RxOk = 0;
+   s_uX64RxForeignDrop = 0;
+   s_uX64RxLastLogMs = 0;
+}
+#endif
+
 int _radio_open_interface_for_read_with_filter(int interfaceIndex, char* szFilter, char* szFilterPrism)
 {
    s_iRadioInterfacesBroken = 0;
@@ -580,6 +610,7 @@ int _radio_open_interface_for_read_with_filter(int interfaceIndex, char* szFilte
    pRadioHWInfo->openedForRead = 0;
    pRadioHWInfo->runtimeInterfaceInfoRx.selectable_fd = -1;
    pRadioHWInfo->runtimeInterfaceInfoRx.iErrorCount = 0;
+   pRadioHWInfo->runtimeInterfaceInfoRx.ppcap = NULL;
 
    szErrbuf[0] = '\0';
    //pRadioHWInfo->runtimeInterfaceInfoRx.ppcap = pcap_open_live(pRadioHWInfo->szName, 4096, 1, 1, szErrbuf);
@@ -631,6 +662,7 @@ int _radio_open_interface_for_read_with_filter(int interfaceIndex, char* szFilte
       return -1;
    }
 
+#if !defined(HW_PLATFORM_X64)
    if (pcap_compile(pRadioHWInfo->runtimeInterfaceInfoRx.ppcap, &bpfprogram, szProgram, 1, 0) == -1)
    {
       puts(szProgram);
@@ -647,6 +679,10 @@ int _radio_open_interface_for_read_with_filter(int interfaceIndex, char* szFilte
       }
       pcap_freecode(&bpfprogram);
    }
+#else
+   // rtw88/Alfa on Linux: kernel BPF drops valid Ruby frames; filter in userspace instead.
+   log_line("x64: skipping kernel BPF on [%s] (would use: [%s])", pRadioHWInfo->szName, szProgram);
+#endif
    pRadioHWInfo->runtimeInterfaceInfoRx.selectable_fd = pcap_get_selectable_fd(pRadioHWInfo->runtimeInterfaceInfoRx.ppcap);
    reset_runtime_radio_rx_info(&(pRadioHWInfo->runtimeInterfaceInfoRx.radioHwRxInfo));
 
@@ -667,8 +703,14 @@ int radio_open_interface_for_read(int interfaceIndex, int portNumber)
       return -1;
 
    int port_encoded = _radio_encode_port(portNumber);
+#if defined(HW_PLATFORM_X64)
+   // Desktop Alfa/rtw88: strict SA match in kernel BPF drops valid Ruby downlink frames.
+   sprintf(szFilter, "(ether[0x00:2] == 0x0801 || ether[0x00:2] == 0x8801) && ether[0x04:1] == 0x%.2x", port_encoded);
+   sprintf(szFilterPrism, "(radio[0x40:2] == 0x0801 || radio[0x40:2] == 0x8801) && radio[0x44:1] == 0x%.2x", port_encoded);
+#else
    sprintf(szFilter, "ether[0x00:2] == 0x0801 && ether[0x0a:4] == 0x13123456 && ether[0x04:1] == 0x%.2x", port_encoded);
    sprintf(szFilterPrism, "radio[0x40:2] == 0x0801 && radio[0x4a:4] == 0x13123456 && radio[0x44:1] == 0x%.2x", port_encoded);
+#endif
 
    int iResult = _radio_open_interface_for_read_with_filter(interfaceIndex, szFilter, szFilterPrism);
    
@@ -709,6 +751,10 @@ int radio_open_interface_for_write(int interfaceIndex)
 
    if ( s_iUsePCAPForTx )
    {
+#if defined(HW_PLATFORM_X64)
+      // Dedicated TX pcap: sharing the RX handle breaks pcap_inject on rtw88 (pairing/RC TX fails).
+      log_line("x64: Opening dedicated pcap for TX inject on %s (separate from RX)", pRadioHWInfo->szName);
+#endif
       log_line("Using ppcap for tx packets.");
       char errbuf[PCAP_ERRBUF_SIZE];
 
@@ -850,7 +896,14 @@ void radio_close_interface_for_write(int interfaceIndex)
    if ( s_iUsePCAPForTx )
    {
       if ( NULL != pRadioHWInfo->runtimeInterfaceInfoTx.ppcap )
+      {
+#if defined(HW_PLATFORM_X64)
+         if ( pRadioHWInfo->runtimeInterfaceInfoTx.ppcap == pRadioHWInfo->runtimeInterfaceInfoRx.ppcap )
+            log_line("x64: TX pcap shared with RX on %s; keeping handle open", pRadioHWInfo->szName);
+         else
+#endif
          pcap_close(pRadioHWInfo->runtimeInterfaceInfoTx.ppcap);
+      }
       else
          log_line("Radio interface %d was not opened for read.", interfaceIndex+1);
    }
@@ -958,15 +1011,34 @@ u8* radio_process_wlan_data_in(int interfaceNumber, int* piOutPacketLength, int*
    struct pcap_pkthdr pcapHeader;
    ppcapPacketHeader = &pcapHeader;
    pRadioPayload = (u8*) pcap_next(pRadioHWInfo->runtimeInterfaceInfoRx.ppcap, ppcapPacketHeader); 
+#if defined(HW_PLATFORM_X64)
+   s_uX64RxPcapCalls++;
+   if ( NULL != pRadioPayload )
+      s_uX64RxPcapHits++;
+   if ( uTimeNow > s_uX64RxLastLogMs + 1000 )
+   {
+      if ( s_uX64RxPcapCalls > 0 || s_uX64RxOk > 0 )
+         log_line("x64 RX stats: pcap_calls=%u pcap_pkts=%u radiotap_fail=%u foreign_drop=%u parsed_ok=%u",
+            s_uX64RxPcapCalls, s_uX64RxPcapHits, s_uX64RxRadiotapFail, s_uX64RxForeignDrop, s_uX64RxOk);
+      s_uX64RxLastLogMs = uTimeNow;
+   }
+#endif
    if ( NULL == pRadioPayload )
       return NULL;
    #ifdef DEBUG_PACKET_RECEIVED
    log_line("RX Buffer: caplen: %d bytes, len: %d", ppcapPacketHeader->caplen, ppcapPacketHeader->len);
    #endif
 
+#if defined(HW_PLATFORM_X64)
+   if (ieee80211_radiotap_iterator_init(&rti,(struct ieee80211_radiotap_header *)pRadioPayload, ppcapPacketHeader->caplen) < 0)
+#else
    if (ieee80211_radiotap_iterator_init(&rti,(struct ieee80211_radiotap_header *)pRadioPayload, ppcapPacketHeader->len) < 0)
+#endif
    {
       log_softerror_and_alarm("rx pcap ERROR: radiotap_iterator_init < 0");
+#if defined(HW_PLATFORM_X64)
+      s_uX64RxRadiotapFail++;
+#endif
       #ifdef FEATURE_RADIO_SYNCHRONIZE_RXTX_THREADS
       if ( 1 == s_iMutexRadioSyncRxTxThreadsInitialized )
          pthread_mutex_unlock(&s_pMutexRadioSyncRxTxThreads);
@@ -1052,9 +1124,56 @@ u8* radio_process_wlan_data_in(int interfaceNumber, int* piOutPacketLength, int*
       }
    }
 
+#if defined(HW_PLATFORM_X64)
+   // Userspace Ruby-frame filter. On x64 the kernel BPF filter is skipped (see
+   // _radio_open_interface_for_read_with_filter): the fixed-offset pcap filter string assumes a
+   // constant radiotap header length, which is wrong on the Alfa/rtw88 desktop drivers and drops
+   // valid Ruby downlink frames. Without any kernel filter, pcap delivers EVERY 802.11 frame on the
+   // channel (foreign APs, beacons, other links). Those foreign frames fail the Ruby CRC downstream
+   // and get counted as bad packets -> bogus "Invalid data detected over the radio links" alarm
+   // (the Radxa never sees this because its kernel BPF drops them in-kernel). Replicate the BPF's
+   // signature check here, but using the radiotap length we actually parsed (rti.max_length) so it
+   // is driver-independent: data frame-control + the Ruby magic 0x13123456 in the source MAC
+   // (offset 10 of the IEEE 802.11 header, matching the kernel filter's ether[0x0a:4]).
+   {
+      int iIEEEOffset = rti.max_length;
+      // Need the fixed first 14 bytes of the 802.11 header (FC..source-MAC magic) to be present.
+      if ( (iIEEEOffset < 0) || (iIEEEOffset + 14 > (int)ppcapPacketHeader->caplen) )
+      {
+         s_uX64RxForeignDrop++;
+         #ifdef FEATURE_RADIO_SYNCHRONIZE_RXTX_THREADS
+         if ( 1 == s_iMutexRadioSyncRxTxThreadsInitialized )
+            pthread_mutex_unlock(&s_pMutexRadioSyncRxTxThreads);
+         #endif
+         return NULL;
+      }
+      u8* pIEEE = pRadioPayload + iIEEEOffset;
+      int bIsRubyFrame = 1;
+      // Frame control: data (0x08) or QoS-data (0x88), subtype byte 0x01 - same as our TX header.
+      if ( (pIEEE[0] != 0x08) && (pIEEE[0] != 0x88) )
+         bIsRubyFrame = 0;
+      // Ruby magic in the transmitter (source) MAC.
+      if ( (pIEEE[10] != 0x13) || (pIEEE[11] != 0x12) || (pIEEE[12] != 0x34) || (pIEEE[13] != 0x56) )
+         bIsRubyFrame = 0;
+      if ( ! bIsRubyFrame )
+      {
+         s_uX64RxForeignDrop++;
+         #ifdef FEATURE_RADIO_SYNCHRONIZE_RXTX_THREADS
+         if ( 1 == s_iMutexRadioSyncRxTxThreadsInitialized )
+            pthread_mutex_unlock(&s_pMutexRadioSyncRxTxThreads);
+         #endif
+         return NULL;
+      }
+   }
+#endif
+
    sRadioLastReceivedHeadersLength = rti.max_length + sizeof(s_uIEEEHeaderData);
    pRadioPayload += sRadioLastReceivedHeadersLength;
+#if defined(HW_PLATFORM_X64)
+   payloadLength = (int)ppcapPacketHeader->caplen - sRadioLastReceivedHeadersLength;
+#else
    payloadLength = ppcapPacketHeader->len - sRadioLastReceivedHeadersLength;
+#endif
    // Ralink and Atheros both always supply the FCS to userspace at the end, so remove it from size
    if (pRadioHWInfo->runtimeInterfaceInfoRx.radioHwRxInfo.nRadiotapFlags & IEEE80211_RADIOTAP_F_FCS)
       payloadLength -= 4;
@@ -1268,6 +1387,9 @@ u8* radio_process_wlan_data_in(int interfaceNumber, int* piOutPacketLength, int*
 
    //return pRadioPayload;
    memcpy(sPayloadBufferRead, pRadioPayload, payloadLength);
+#if defined(HW_PLATFORM_X64)
+   s_uX64RxOk++;
+#endif
    return sPayloadBufferRead;
 }
 
@@ -1305,6 +1427,12 @@ int packet_process_and_check(int interfaceNb, u8* pPacketBuffer, int iBufferLeng
    int iPacketLength = pPH->total_length;
    u8 uPacketFlags = pPH->packet_flags;
 
+   if ( iPacketLength < (int)sizeof(t_packet_header) )
+   {
+      s_iLastProcessingErrorCode = RADIO_PROCESSING_ERROR_CODE_PACKET_RECEIVED_TOO_SMALL;
+      return 0;
+   }
+
    if ( iPacketLength > iBufferLength )
    {
       s_iLastProcessingErrorCode = RADIO_PROCESSING_ERROR_CODE_PACKET_RECEIVED_TOO_SMALL;
@@ -1330,7 +1458,15 @@ int packet_process_and_check(int interfaceNb, u8* pPacketBuffer, int iBufferLeng
    if ( pPH->packet_flags & PACKET_FLAGS_BIT_HEADERS_ONLY_CRC )
       uCRC = base_compute_crc32(pPacketBuffer+sizeof(u32), sizeof(t_packet_header)-sizeof(u32));
    else
-      uCRC = base_compute_crc32(pPacketBuffer+sizeof(u32), pPH->total_length-sizeof(u32));
+   {
+      int iCrcLength = iPacketLength - (int)sizeof(u32);
+      if ( iCrcLength <= 0 || iCrcLength > iBufferLength - (int)sizeof(u32) )
+      {
+         s_iLastProcessingErrorCode = RADIO_PROCESSING_ERROR_CODE_PACKET_RECEIVED_TOO_SMALL;
+         return 0;
+      }
+      uCRC = base_compute_crc32(pPacketBuffer+sizeof(u32), iCrcLength);
+   }
 
    if ( (uCRC & 0x00FFFFFF) != (pPH->uCRC & 0x00FFFFFF) )
    {
@@ -1517,7 +1653,9 @@ int radio_write_raw_ieee_packet(int interfaceIndex, u8* pData, int dataLength, i
          len = pcap_inject(pRadioHWInfo->runtimeInterfaceInfoTx.ppcap, pData, dataLength);
          if ( len < dataLength )
          {
-            log_softerror_and_alarm("RadioError: tx ppcap failed to send radio message (%d bytes sent of %d bytes).", len, dataLength);
+            const char* pszPcapErr = pcap_geterr(pRadioHWInfo->runtimeInterfaceInfoTx.ppcap);
+            log_softerror_and_alarm("RadioError: tx ppcap failed to send radio message (%d bytes sent of %d bytes). pcap: [%s]",
+               len, dataLength, (NULL != pszPcapErr) ? pszPcapErr : "");
             pRadioHWInfo->runtimeInterfaceInfoTx.iErrorCount++;
             #ifdef FEATURE_RADIO_SYNCHRONIZE_RXTX_THREADS
             if ( 1 == s_iMutexRadioSyncRxTxThreadsInitialized )

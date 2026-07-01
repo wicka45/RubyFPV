@@ -78,10 +78,15 @@
 #if defined (HW_PLATFORM_RASPBERRY)
 #include "../renderer/render_engine_raw.h"
 #endif
-#if defined (HW_PLATFORM_RADXA)
+#if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 #include "../renderer/drm_core.h"
 #include "../renderer/render_engine_cairo.h"
 #include <SDL2/SDL.h>
+#endif
+#if defined(HW_PLATFORM_X64)
+#include "../base/shared_mem_video_disp.h"
+#include <sys/mman.h>
+#include <fcntl.h>
 #endif
 
 #include "../common/string_utils.h"
@@ -376,10 +381,23 @@ void _draw_background_picture()
 }
 
 // returns true if it rendered a background
+#if defined(HW_PLATFORM_X64)
+bool _central_blit_video_background();   // defined below; composites decoded video as the OSD background
+#endif
+
 bool _render_video_background()
 {
+#if ! defined(HW_PLATFORM_X64)
+   // Pi/Radxa render the intro on their own video plane, so the compositor bails during it.
    if ( g_bPlayIntro )
       return true;
+#endif
+#if defined(HW_PLATFORM_X64)
+   // x64: paint the decoded video as the background here (incl. the intro clip, whose frames the
+   // player writes to the same /RUBY_VIDEO_DISP shm); the OSD then renders on top of it.
+   if ( _central_blit_video_background() )
+      return true;
+#endif
 
    u32 uVehicleIdFullVideo = 0;
    u32 uVehicleSoftwareVersion = 0;
@@ -526,7 +544,14 @@ void render_background_and_paddings(bool bForceBackground)
          sem_unlink(SEMAPHORE_VIDEO_FILE_PLAYBACK_WILL_FINISH);
       }
       if ( ! g_bPlayIntroWillEnd )
+      {
+#if defined(HW_PLATFORM_X64)
+         // x64: the intro plays via the player -> /RUBY_VIDEO_DISP shm -> central compositing, so draw
+         // those frames during the intro (Pi/Radxa render the intro directly, hence the plain return).
+         _render_video_background();
+#endif
          return;
+      }
    }
 
    bool bShowBgPicture = false;
@@ -673,6 +698,137 @@ void render_background_and_paddings(bool bForceBackground)
          s_fCurrentAdaptiveBandHeightPercent = s_fCurrentAdaptiveBandHeightPercent + (s_fTargetAdaptiveBandHeightPercent - s_fCurrentAdaptiveBandHeightPercent)*0.1;
    }
 }
+
+// Choose the DRM plane the OSD renders on. On x64 with the video plane enabled (default), the OSD
+// goes on an ARGB OVERLAY (-2) so the decoded video can render on the PRIMARY plane below it (the
+// primary can hardware-scale to fullscreen). Otherwise (Radxa, or RUBY_VIDEO_PLANE=0) the OSD uses
+// the default plane (0). If no overlay is available, drm_core falls back to the default plane.
+static int _central_osd_drm_plane_index()
+{
+   // Software-composite path: the OSD stays on the primary plane and the decoded video is painted
+   // into the OSD's draw buffer as its background (see _central_blit_video_background). The -2
+   // overlay-OSD layout is kept in drm_core for GPUs that expose an ARGB overlay, but this hardware
+   // (HD3000) does not, so we use the primary for both.
+   return 0;
+}
+
+#if defined(HW_PLATFORM_X64)
+// x64 software video compositor: paint the latest decoded frame (from ruby_player_x64's shared mem)
+// as the OSD background, then the OSD renders ON TOP of it (called from _render_video_background,
+// after startFrame() has cleared the buffer). On this GPU the only overlay plane has no alpha, so a
+// hardware OSD-over-video layering isn't possible; compositing into the OSD's (primary, ARGB) draw
+// buffer gives correct layering + fullscreen. Env-gated: RUBY_VIDEO_PLANE=0 disables (OSD only).
+static type_video_disp_shm* s_pVideoDispSHM = NULL;
+static u8* s_pVideoDispStaging = NULL;
+static u32 s_uLastVideoDispSeq = 0xFFFFFFFF;
+static int s_iVideoPlaneEnabled = -1;   // -1 unknown, 0 off, 1 on
+static int s_iStgW = 0, s_iStgH = 0, s_iStgStride = 0;   // staged decoded frame geometry
+static u32 s_uTimeLastVideoComposited = 0;   // last g_TimeNow a video frame was composited; promotes render FPS
+
+bool _central_blit_video_background()
+{
+   if ( ruby_drm_core_is_gpu_composite() )
+   {
+      // Console GPU composite: drm_core reads /RUBY_VIDEO_DISP and blends the decoded video UNDER the OSD on
+      // the GPU. Skip the CPU video blit; leave the OSD draw buffer transparent (cleared to 0). Keep the
+      // render-FPS promotion so the OSD over live video stays smooth.
+      s_uTimeLastVideoComposited = g_TimeNow;
+      return true;
+   }
+   if ( 0 == s_iVideoPlaneEnabled )
+      return false;
+   if ( -1 == s_iVideoPlaneEnabled )
+   {
+      const char* szVP = getenv("RUBY_VIDEO_PLANE");
+      s_iVideoPlaneEnabled = ((NULL != szVP) && (szVP[0] == '0')) ? 0 : 1;
+      log_line("[Central] Video background %s.", s_iVideoPlaneEnabled ? "enabled (composited under the OSD)" : "disabled (RUBY_VIDEO_PLANE=0)");
+      if ( 0 == s_iVideoPlaneEnabled )
+         return false;
+   }
+   if ( NULL == s_pVideoDispSHM )
+   {
+      int fd = shm_open(SHARED_MEM_VIDEO_DISP_NAME, O_RDONLY, S_IRUSR | S_IWUSR);
+      if ( fd < 0 )
+         return false;
+      s_pVideoDispSHM = (type_video_disp_shm*) mmap(NULL, SHARED_MEM_VIDEO_DISP_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+      close(fd);
+      if ( (MAP_FAILED == s_pVideoDispSHM) || (NULL == s_pVideoDispSHM) ) { s_pVideoDispSHM = NULL; return false; }
+      log_line("[Central] Opened decoded-video shared mem %s for compositing.", SHARED_MEM_VIDEO_DISP_NAME);
+   }
+
+   // Refresh the staged frame if a newer one is available (seqlock). We keep the last frame so we can
+   // re-paint it every render pass (startFrame clears the buffer), even if no new frame arrived.
+   type_video_disp_shm* pv = s_pVideoDispSHM;
+   if ( pv->uMagic == VIDEO_DISP_MAGIC )
+   {
+      u32 uSeq1 = pv->uSeq;
+      if ( (0 == (uSeq1 & 1)) && (uSeq1 != s_uLastVideoDispSeq) )
+      {
+         __sync_synchronize();
+         u32 uW = pv->uWidth, uH = pv->uHeight, uStride = pv->uStride, uSize = pv->uFrameSize;
+         if ( (uW > 0) && (uH > 0) && (uSize > 0) && (uSize <= (u32)VIDEO_DISP_MAX_FRAME_SIZE) )
+         {
+            if ( NULL == s_pVideoDispStaging )
+               s_pVideoDispStaging = (u8*) malloc(VIDEO_DISP_MAX_FRAME_SIZE);
+            if ( NULL != s_pVideoDispStaging )
+            {
+               memcpy(s_pVideoDispStaging, pv->data, uSize);
+               __sync_synchronize();
+               if ( pv->uSeq == uSeq1 )   // not torn during the copy
+               {
+                  s_uLastVideoDispSeq = uSeq1;
+                  s_iStgW = (int)uW; s_iStgH = (int)uH; s_iStgStride = (int)uStride;
+               }
+            }
+         }
+      }
+   }
+
+   if ( (NULL == s_pVideoDispStaging) || (s_iStgW <= 0) || (s_iStgH <= 0) )
+      return false;
+
+   type_drm_buffer* pBuf = ruby_drm_core_get_back_draw_buffer();
+   if ( (NULL == pBuf) || (NULL == pBuf->pData) || (0 == pBuf->uWidth) || (0 == pBuf->uHeight) )
+      return false;
+
+   int dstW = (int)pBuf->uWidth, dstH = (int)pBuf->uHeight;
+   int srcW = s_iStgW, srcH = s_iStgH, srcStride = s_iStgStride;
+
+   // Aspect-fit rectangle inside the display.
+   int rw = dstW;
+   int rh = (int)((long long)srcH * dstW / srcW);
+   if ( rh > dstH ) { rh = dstH; rw = (int)((long long)srcW * dstH / srcH); }
+   if ( (rw <= 0) || (rh <= 0) )
+      return false;
+   int rx = (dstW - rw)/2; if ( rx < 0 ) rx = 0;
+   int ry = (dstH - rh)/2; if ( ry < 0 ) ry = 0;
+
+   // Fast nearest-neighbor scale (fixed-point), BGRx -> the ARGB32 draw buffer. Source rows are
+   // 4-byte pixels; copy the u32 but force the alpha byte to 0xFF. The DRM primary plane itself
+   // ignores alpha, but the OSD renderer reuses this same buffer and alpha-blends its
+   // semi-transparent backgrounds against it (see RenderEngineCairo::_blend_pixel): an opaque
+   // (alpha=0xFF) video pixel is what tells the OSD "there is video here, blend over it", so the
+   // background-transparency setting actually shows the video through. Pixels left at alpha 0
+   // (the cleared letterbox bars / no-video areas) stay opaque-black behind the OSD, as intended.
+   uint32_t uXStep = ((uint32_t)srcW << 16) / (uint32_t)rw;
+   uint32_t uYStep = ((uint32_t)srcH << 16) / (uint32_t)rh;
+   uint32_t uSy = 0;
+   for( int dy=0; dy<rh; dy++ )
+   {
+      const uint32_t* pSrcRow = (const uint32_t*)(s_pVideoDispStaging + (size_t)(uSy >> 16) * (size_t)srcStride);
+      uint32_t* pDstRow = (uint32_t*)(pBuf->pData + (size_t)(ry + dy) * (size_t)pBuf->uStride) + rx;
+      uint32_t uSx = 0;
+      for( int dx=0; dx<rw; dx++ )
+      {
+         pDstRow[dx] = pSrcRow[uSx >> 16] | 0xFF000000u;
+         uSx += uXStep;
+      }
+      uSy += uYStep;
+   }
+   s_uTimeLastVideoComposited = g_TimeNow;
+   return true;
+}
+#endif
 
 void render_all_with_menus(u32 timeNow, bool bRenderMenus, bool bForceBackground, bool bDoInputLoop)
 {
@@ -2452,6 +2608,24 @@ void main_loop_r_central()
    int dt = 1000/15;
    if ( 0 != g_pControllerSettings->iRenderFPS )
       dt = 1000/g_pControllerSettings->iRenderFPS;
+#if defined(HW_PLATFORM_X64)
+   // x64 composites the decoded video INTO the OSD draw buffer (see _central_blit_video_background),
+   // so on-screen video smoothness is capped by the OSD render rate. The 15fps default (fine on
+   // Pi/Radxa, where video lives on its own independent hardware plane) makes video look choppy
+   // here. While a video frame was composited recently, render at the panel rate (60fps) so every
+   // decoded frame is shown and the cadence is even (30fps video -> 2 panel frames each; the ~33fps
+   // DVR clips sample much finer than at 30). The render is single-threaded, so if a full-OSD frame
+   // can't fit in ~16ms it will saturate one core and fall short of 60 -> that is the signal to
+   // decouple the video blit from the OSD render. (Pi/Radxa untouched; this whole block is x64-only.)
+   // Also promote when a menu is on top: menus don't composite video, so without this they fall back
+   // to the 15fps base cadence and navigation lags badly (each keypress's visual result waits a
+   // ~66ms render tick, then the blocking vblank commit). At 60fps the menu tracks input. DVR
+   // playback already keeps the composite timestamp fresh, but g_bIsVideoPlaying is listed for clarity.
+   if ( ((0 != s_uTimeLastVideoComposited) && (g_TimeNow < s_uTimeLastVideoComposited + 500))
+        || g_bIsVideoPlaying || isMenuOn() )
+      if ( dt > 1000/60 )
+         dt = 1000/60;
+#endif
    if ( g_TimeNow >= s_uTimeLastRender+dt )
    {
       ruby_signal_alive();
@@ -2742,14 +2916,26 @@ int main(int argc, char *argv[])
    hdmi_enum_modes();
    #endif
 
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    ruby_drm_core_wait_for_display_connected();
    hdmi_enum_modes();
    int iHDMIIndex = hdmi_load_current_mode();
    if ( iHDMIIndex < 0 )
       iHDMIIndex = hdmi_get_best_resolution_index_for(DEFAULT_RADXA_DISPLAY_WIDTH, DEFAULT_RADXA_DISPLAY_HEIGHT, DEFAULT_RADXA_DISPLAY_REFRESH);
-   log_line("HDMI mode to use: %d (%d x %d @ %d)", iHDMIIndex, hdmi_get_current_resolution_width(), hdmi_get_current_resolution_height(), hdmi_get_current_resolution_refresh() );
-   ruby_drm_core_init(0, DRM_FORMAT_ARGB8888, hdmi_get_current_resolution_width(), hdmi_get_current_resolution_height(), hdmi_get_current_resolution_refresh());
+   int iDrmW = hdmi_get_current_resolution_width();
+   int iDrmH = hdmi_get_current_resolution_height();
+   int iDrmR = hdmi_get_current_resolution_refresh();
+   if ( hdmi_get_resolutions_count() <= 0 || iDrmW <= 0 || iDrmH <= 0 )
+   {
+      log_line("[Central] Using DRM native panel mode (no HDMI enumeration match)");
+      iDrmW = iDrmH = iDrmR = 0;
+   }
+   log_line("HDMI mode to use: %d (%d x %d @ %d)", iHDMIIndex, iDrmW, iDrmH, iDrmR );
+   if ( ruby_drm_core_init(_central_osd_drm_plane_index(), DRM_FORMAT_ARGB8888, iDrmW, iDrmH, iDrmR) != 0 )
+   {
+      log_softerror_and_alarm("[Central] DRM init failed; retry native mode");
+      ruby_drm_core_init(_central_osd_drm_plane_index(), DRM_FORMAT_ARGB8888, 0, 0, 0);
+   }
    ruby_drm_core_set_plane_properties_and_buffer(ruby_drm_core_get_main_draw_buffer_id());
    ruby_drm_enable_vsync(g_pControllerSettings->iHDMIVSync);
    #endif
@@ -2800,7 +2986,7 @@ int main(int argc, char *argv[])
             is_semaphore_signaled_clear(s_pSemaphoreVideoIntro, SEMAPHORE_VIDEO_FILE_PLAYBACK_FINISHED);
             g_bPlayIntroWillEnd = false;
             char szComm[256];
-            sprintf(szComm, "./%s -file res/intro.h264 -fps 15 -endexit&", VIDEO_PLAYER_OFFLINE);
+            sprintf(szComm, "./%s -file res/intro.h264 -fps 30 -endexit&", VIDEO_PLAYER_OFFLINE);   // intro.h264 is 30fps (150 frames/5s)
             hw_execute_bash_command_nonblock(szComm, NULL);
             hardware_sleep_ms(500);
             hardware_sleep_ms(500);
@@ -2913,11 +3099,19 @@ int main(int argc, char *argv[])
 
    log_line("Start main loop.");
 
-   while (!g_bQuit) 
+   while (!g_bQuit)
    {
       g_uLoopCounter++;
       g_TimeNow = get_current_timestamp_ms();
       g_TimeNowMicros = get_current_timestamp_micros();
+#if defined(HW_PLATFORM_X64)
+      if ( ruby_drm_core_window_closed() )   // windowed mode: user closed the GS window -> quit cleanly
+      {
+         log_line("[Central] GS window closed by user -> quitting.");
+         g_bQuit = true;
+         break;
+      }
+#endif
       if ( rx_scope_is_started() )
       {
          try_read_messages_from_router(10);
@@ -2985,7 +3179,7 @@ void ruby_reinit_hdmi_display()
    free_all_fonts();
    render_free_engine();
    
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    ruby_drm_core_uninit();
    ruby_drm_core_wait_for_display_connected();
 
@@ -2993,8 +3187,20 @@ void ruby_reinit_hdmi_display()
    int iHDMIIndex = hdmi_load_current_mode();
    if ( iHDMIIndex < 0 )
       iHDMIIndex = hdmi_get_best_resolution_index_for(DEFAULT_RADXA_DISPLAY_WIDTH, DEFAULT_RADXA_DISPLAY_HEIGHT, DEFAULT_RADXA_DISPLAY_REFRESH);
-   log_line("HDMI mode to use: %d (%d x %d @ %d)", iHDMIIndex, hdmi_get_current_resolution_width(), hdmi_get_current_resolution_height(), hdmi_get_current_resolution_refresh() );
-   ruby_drm_core_init(0, DRM_FORMAT_ARGB8888, hdmi_get_current_resolution_width(), hdmi_get_current_resolution_height(), hdmi_get_current_resolution_refresh());
+   int iDrmW = hdmi_get_current_resolution_width();
+   int iDrmH = hdmi_get_current_resolution_height();
+   int iDrmR = hdmi_get_current_resolution_refresh();
+   if ( hdmi_get_resolutions_count() <= 0 || iDrmW <= 0 || iDrmH <= 0 )
+   {
+      log_line("[Central] Using DRM native panel mode (no HDMI enumeration match)");
+      iDrmW = iDrmH = iDrmR = 0;
+   }
+   log_line("HDMI mode to use: %d (%d x %d @ %d)", iHDMIIndex, iDrmW, iDrmH, iDrmR );
+   if ( ruby_drm_core_init(_central_osd_drm_plane_index(), DRM_FORMAT_ARGB8888, iDrmW, iDrmH, iDrmR) != 0 )
+   {
+      log_softerror_and_alarm("[Central] DRM init failed; retry native mode");
+      ruby_drm_core_init(_central_osd_drm_plane_index(), DRM_FORMAT_ARGB8888, 0, 0, 0);
+   }
    ruby_drm_core_set_plane_properties_and_buffer(ruby_drm_core_get_main_draw_buffer_id());
    ruby_drm_enable_vsync(g_pControllerSettings->iHDMIVSync);
    #endif
@@ -3064,7 +3270,7 @@ void ruby_shutdown_ui()
 
    render_free_engine();
 
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    ruby_drm_core_uninit();
    #endif
 

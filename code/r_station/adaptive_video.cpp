@@ -200,6 +200,22 @@ void _adaptive_video_reset_kf_state(Model* pModel, type_global_state_vehicle_run
       (pModel->video_link_profiles[pModel->video_params.iCurrentVideoProfile].uProfileEncodingFlags & VIDEO_PROFILE_ENCODING_FLAG_ENABLE_ADAPTIVE_VIDEO_KEYFRAME)?"adaptive":"fixed", pRuntimeInfo->iPendingKeyFrameMsToSet);
 }
 
+#if defined(HW_PLATFORM_X64)
+// Adaptive Phase 2 (GS decode ceiling): the GS software-decode ceiling is ~constant for a given
+// resolution/codec/fps, so after repeated decode-behind episodes we LEARN a max bitrate just below
+// where it skips and cap the up-ramp there -- converges to a stable rate instead of sawtoothing
+// 2.5<->skip forever. Cleared on stream/codec/res change in adaptive_video_reset_state(). Single
+// active stream -> file-scope state.
+// A couple of retransmissions can come from EPHEMERAL interference (a wall, a microwave) rather than a
+// genuinely degrading link, so tolerate up to this many in the window before treating loss as RF. At or
+// below this, the GS-side bitrate-only decode-throttle may act (datarate held); above it, defer to the
+// link-quality path (which cuts the datarate too, for range/robustness). Tunable bellwether.
+#define ADAPTIVE_GS_RETR_TOLERANCE 2
+static u32 s_uGSDecodeCeilingBPS = 0;     // locked sustainable bitrate = up-ramp cap (0 = none yet)
+static u32 s_uGSLastDownStepMs = 0;       // rate-limits the progressive decode-driven down-step (~1/1.5s)
+static bool s_bPrevGSDecodeBehind = false;
+#endif
+
 void adaptive_video_reset_state(u32 uVehicleId)
 {
    log_line("[AdaptiveVideo] Reseting state for VID: %u", uVehicleId);
@@ -230,6 +246,10 @@ void adaptive_video_reset_state(u32 uVehicleId)
    g_State.vehiclesRuntimeInfo[iRuntimeIndex].uLastTimeSentAdaptiveVideoRequest = 0;
    g_State.vehiclesRuntimeInfo[iRuntimeIndex].uTimeStartCountingMetricAreOkToSwithHigher = 0;
    g_State.vehiclesRuntimeInfo[iRuntimeIndex].uLastTimeRecvAdaptiveVideoAck = 0;
+#if defined(HW_PLATFORM_X64)
+   // New stream/codec/resolution -> different decode ceiling -> forget the learned one.
+   s_uGSDecodeCeilingBPS = 0; s_uGSLastDownStepMs = 0; s_bPrevGSDecodeBehind = false;
+#endif
 
    g_State.vehiclesRuntimeInfo[iRuntimeIndex].uCurrentAdaptiveVideoTargetVideoBitrateBPS = 0;
    g_State.vehiclesRuntimeInfo[iRuntimeIndex].uCurrentAdaptiveVideoECScheme = 0xFFFF;
@@ -762,12 +782,34 @@ bool _adaptive_video_is_metrics_below_or_above_strength(int iStrength, Model* pM
 
    if ( bBelow && (s_iAdaptiveMetric_TotalBadVideoBlocksIntervals > iMaxBadVideoBlocks) )
    {
-      shared_mem_video_stream_stats* pSMVideoStreamInfo = get_shared_mem_video_stream_stats_for_vehicle(&g_SM_VideoDecodeStats, pModel->uVehicleId);
-      if ( NULL != pSMVideoStreamInfo )
-          pSMVideoStreamInfo->adaptiveHitsLow.iCountHitVideoLost++;
-      bLastAdaptiveCheckWasAllAbove = false;
-      log_line("[AdaptiveVideo] Hit on (strength %d, %u ms, %d intvls, %d video blcks) total bad video %d is greater than %d", iStrength, s_uAdaptiveMetric_TimeToLookBackMs, s_iAdaptiveMetric_IntervalsToLookBack, s_iAdaptiveMetric_TotalOutputVideoBlocks, s_iAdaptiveMetric_TotalBadVideoBlocksIntervals, iMaxBadVideoBlocks);
-      return true;
+#if defined(HW_PLATFORM_X64)
+      // x64 GS: these "bad video blocks" are blocks the GS itself DISCARDED for being output too late
+      // (software H.265 decode pace / router loop cadence), NOT lost on the radio. If reception is
+      // clean (zero retransmissions requested in the window) this is a GS-SIDE limit, and collapsing
+      // the radio datarate for it punishes a perfectly good link (confirmed: H.265 walk-downs were
+      // 100% this metric with 0 retr / 0 RxLost). Hold the rate instead -- mark not-all-above (so we
+      // don't ramp UP into more discards) but do NOT switch lower; fall through to the link-quality
+      // metrics below, which stay quiet when the link is good. Only collapse on real reception trouble.
+      if ( s_iAdaptiveMetric_TotalRequestedRetr <= ADAPTIVE_GS_RETR_TOLERANCE )
+      {
+         bLastAdaptiveCheckWasAllAbove = false;
+         static u32 s_uLastGSLimitLogMs = 0;
+         if ( g_TimeNow > s_uLastGSLimitLogMs + 3000 )
+         {
+            s_uLastGSLimitLogMs = g_TimeNow;
+            log_softerror_and_alarm("[AdaptiveGS] %d GS-discarded video blocks, reception clean-enough (%d retr <= %d) -> GS-side decode/output limit; holding rate, NOT collapsing the link.", s_iAdaptiveMetric_TotalBadVideoBlocksIntervals, s_iAdaptiveMetric_TotalRequestedRetr, ADAPTIVE_GS_RETR_TOLERANCE);
+         }
+      }
+      else
+#endif
+      {
+         shared_mem_video_stream_stats* pSMVideoStreamInfo = get_shared_mem_video_stream_stats_for_vehicle(&g_SM_VideoDecodeStats, pModel->uVehicleId);
+         if ( NULL != pSMVideoStreamInfo )
+             pSMVideoStreamInfo->adaptiveHitsLow.iCountHitVideoLost++;
+         bLastAdaptiveCheckWasAllAbove = false;
+         log_line("[AdaptiveVideo] Hit on (strength %d, %u ms, %d intvls, %d video blcks) total bad video %d is greater than %d", iStrength, s_uAdaptiveMetric_TimeToLookBackMs, s_iAdaptiveMetric_IntervalsToLookBack, s_iAdaptiveMetric_TotalOutputVideoBlocks, s_iAdaptiveMetric_TotalBadVideoBlocksIntervals, iMaxBadVideoBlocks);
+         return true;
+      }
    }
 
    if ( (!bBelow) && (s_iAdaptiveMetric_TotalBadVideoBlocksIntervals > iMaxBadVideoBlocks) )
@@ -1244,6 +1286,30 @@ bool _adaptive_video_switch_higher(Model* pModel, type_global_state_vehicle_runt
 }
 
 // Returns true if it switched adaptive level
+// x64 GS render/decode throttle: reduce ONLY the encode video bitrate (less CABAC work -> the software
+// HEVC decoder can render in realtime), WITHOUT touching the radio datarate or DR boost. This fires on a
+// GS-side decode limit with a HEALTHY link (clean reception), so collapsing the datarate (as the normal
+// switch_lower does, by first cutting DR boost) is exactly wrong -- keep the link high (e.g. 48/54) and
+// just ask the vehicle for fewer video bits. Damped by the caller's 2.5s rate-limit; floored at the
+// lowest allowed adaptive bitrate. Reuses the existing pending-bitrate send path (no new protocol).
+bool _adaptive_video_gs_reduce_video_bitrate_only(Model* pModel, type_global_state_vehicle_runtime_info* pRuntimeInfo)
+{
+   (void)pModel;
+   u32 uCur = pRuntimeInfo->uCurrentAdaptiveVideoTargetVideoBitrateBPS;
+   if ( 0 == uCur )
+      return false;
+   u32 uNew = uCur - uCur/5;                                  // -20% per step
+   if ( uNew < DEFAULT_LOWEST_ALLOWED_ADAPTIVE_VIDEO_BITRATE )
+      uNew = DEFAULT_LOWEST_ALLOWED_ADAPTIVE_VIDEO_BITRATE;
+   if ( uNew >= uCur )
+      return false;                                           // already at/below floor
+   pRuntimeInfo->uCurrentAdaptiveVideoTargetVideoBitrateBPS = uNew;
+   pRuntimeInfo->uPendingVideoBitrateToSet = uNew;
+   pRuntimeInfo->uAdaptiveVideoRequestId++;
+   log_softerror_and_alarm("[AdaptiveGS] render throttle: video bitrate %.2f -> %.2f Mbps (datarate/DR-boost HELD; link untouched)", (float)uCur/1000000.0, (float)uNew/1000000.0);
+   return true;
+}
+
 bool _adaptive_video_check_vehicle(Model* pModel, type_global_state_vehicle_runtime_info* pRuntimeInfo, shared_mem_video_stream_stats* pSMVideoStreamInfo)
 {
    if ( (NULL == pRuntimeInfo) || (NULL == pSMVideoStreamInfo) || (NULL == pModel) )
@@ -1284,6 +1350,60 @@ bool _adaptive_video_check_vehicle(Model* pModel, type_global_state_vehicle_runt
 
    _adaptive_video_compute_metrics(pModel, pRuntimeInfo);
    
+#if defined(HW_PLATFORM_X64)
+   // GS keep-up (codec-agnostic -- keys on the decoder's BACKLOG, not the codec): if the ground
+   // station's decoder is chronically behind realtime, step the encode rate down PROGRESSIVELY --
+   // ONE ladder step, rate-limited to ~2.5s so each step reaches the vehicle and the backlog responds
+   // before the next. This walks the bitrate DOWN to the sustainable rate instead of cascading to the
+   // ~2Mbit EC floor (which is what happened when this fired every uMinimumTimeToSwitchLower=20ms and
+   // blew through DR-boost + the whole datarate ladder in ~1s). When the backlog then CLEARS, lock
+   // that proven rate as the up-ramp ceiling so it HOLDS there (no walk-back-up-and-flash sawtooth).
+   // Reuses the existing adaptive-video-params request; no new protocol or vehicle-side handling.
+   {
+      bool rx_video_output_is_gs_decode_behind(u32* puLastBehindMs);   // from rx_video_output.cpp
+      bool bGSBehind = rx_video_output_is_gs_decode_behind(NULL);
+
+      // Only treat "decoder behind" as a GS-SIDE limit when reception is clean enough -- at most a
+      // couple of retransmissions (ephemeral interference: a wall, a microwave). Above the tolerance the
+      // link is genuinely degrading (distance / interference), and a low render-FPS or growing backlog
+      // is then from LOST frames, not slow decode -- bypass this bitrate-only throttle so the
+      // link-quality metrics below cut BOTH the video bitrate AND the radio datarate (a lower datarate
+      // travels farther / is more robust). Reset the edge state so we don't fire a spurious "caught up"
+      // ceiling-lock on the bypass.
+      if ( s_iAdaptiveMetric_TotalRequestedRetr > ADAPTIVE_GS_RETR_TOLERANCE )
+      {
+         bGSBehind = false;
+         s_bPrevGSDecodeBehind = false;
+      }
+
+      if ( (! bGSBehind) && s_bPrevGSDecodeBehind )   // behind -> clear edge: this rate is sustainable
+      {
+         u32 uGoodBPS = pRuntimeInfo->uCurrentAdaptiveVideoTargetVideoBitrateBPS;
+         if ( uGoodBPS > 0 )
+         {
+            s_uGSDecodeCeilingBPS = uGoodBPS;
+            log_softerror_and_alarm("[AdaptiveGS] decoder caught up at %.2f Mbps -> locked as up-ramp ceiling", (float)uGoodBPS/1000000.0);
+         }
+      }
+      s_bPrevGSDecodeBehind = bGSBehind;
+
+      if ( bGSBehind )
+      if ( g_TimeNow > s_uGSLastDownStepMs + 2500 )   // progressive: one step per ~2.5s
+      {
+         pRuntimeInfo->uTimeStartCountingMetricAreOkToSwithHigher = 0;
+         // RENDER/DECODE throttle: cut ONLY the encode video bitrate (less CABAC -> the SW decoder
+         // renders smoothly) and HOLD the radio datarate/DR-boost. This fires on a GS-side decode limit
+         // with a HEALTHY link (clean reception), so collapsing the datarate via switch_lower's DR-boost
+         // cut is wrong -- keep the datarate high (e.g. 48/54) and just ask the vehicle for fewer bits.
+         if ( _adaptive_video_gs_reduce_video_bitrate_only(pModel, pRuntimeInfo) )
+         {
+            s_uGSLastDownStepMs = g_TimeNow;
+            return true;
+         }
+      }
+   }
+#endif
+
    if ( g_TimeNow > pRuntimeInfo->uLastTimeSentAdaptiveVideoRequest + s_AdaptiveMetrics.uMinimumTimeToSwitchLower )
    if ( (pRuntimeInfo->uCurrentAdaptiveVideoECScheme == 0xFFFF) || (pRuntimeInfo->uCurrentAdaptiveVideoECScheme == 0) )
    if ( _adaptive_video_should_switch_lower(pModel, pRuntimeInfo) )
@@ -1300,6 +1420,20 @@ bool _adaptive_video_check_vehicle(Model* pModel, type_global_state_vehicle_runt
    ProcessorRxVideo* pProcessorRxVideo = ProcessorRxVideo::getVideoProcessorForVehicleId(pModel->uVehicleId, 0);
    bool bChecksToSwitchHigherSucceeded = false;
 
+#if defined(HW_PLATFORM_X64)
+   bool bGSBehindRecent = false;
+   {
+      bool rx_video_output_is_gs_decode_behind(u32* puLastBehindMs);   // from rx_video_output.cpp
+      u32 uLastBehind = 0;
+      bool bGSBehind = rx_video_output_is_gs_decode_behind(&uLastBehind);
+      // Block the link-driven up-ramp from undoing a decode-driven down-step until the GS has been
+      // caught up for >=5s (asymmetric hysteresis -> no hunting between the two triggers).
+      bGSBehindRecent = bGSBehind || ((0 != uLastBehind) && (g_TimeNow < uLastBehind + 5000));
+   }
+   // Hold at the locked sustainable decode rate: never let the link-driven up-ramp climb to/above it.
+   bool bBelowGSCeiling = (s_uGSDecodeCeilingBPS == 0) || (pRuntimeInfo->uCurrentAdaptiveVideoTargetVideoBitrateBPS < s_uGSDecodeCeilingBPS);
+   if ( (! bGSBehindRecent) && bBelowGSCeiling )
+#endif
    if ( g_TimeNow > pRuntimeInfo->uLastTimeSentAdaptiveVideoRequest + s_AdaptiveMetrics.uMinimumTimeToSwitchHigher )
    if ( 0 != pRuntimeInfo->uCurrentAdaptiveVideoTargetVideoBitrateBPS )
    if ( 0 != pModel->video_link_profiles[pModel->video_params.iCurrentVideoProfile].uTargetVideoBitrateBPS )

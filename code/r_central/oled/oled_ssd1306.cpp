@@ -20,8 +20,12 @@ static ssd1306_handle_t gs_handle;
 
 int ssd1306_iic_init()
 {
+#if defined(HW_PLATFORM_X64)
+    return -1;
+#else
     i2c_fd = wiringPiI2CSetup(gs_handle.iic_addr);
     return 0;
+#endif
 }
 
 int ssd1306_iic_deinit()

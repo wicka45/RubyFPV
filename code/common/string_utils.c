@@ -768,6 +768,36 @@ char* str_format_frequency_no_sufix(u32 uFrequencyKhz)
 }
 
 
+#if defined(HW_PLATFORM_X64)
+// Generic x86_64 ground station: report the real machine name from DMI/SMBIOS (e.g. "MacBookAir4,2"),
+// read once and cached. No root or extra tools needed.
+static const char* _str_get_x86_board_name()
+{
+   static char s_szX86BoardName[64] = {0};
+   if ( 0 == s_szX86BoardName[0] )
+   {
+      FILE* fp = fopen("/sys/class/dmi/id/product_name", "r");
+      if ( NULL != fp )
+      {
+         if ( NULL == fgets(s_szX86BoardName, sizeof(s_szX86BoardName), fp) )
+            s_szX86BoardName[0] = 0;
+         fclose(fp);
+      }
+      for( int i=0; (i<(int)sizeof(s_szX86BoardName)) && (s_szX86BoardName[i] != 0); i++ )
+      {
+         if ( (s_szX86BoardName[i] == '\n') || (s_szX86BoardName[i] == '\r') )
+         {
+            s_szX86BoardName[i] = 0;
+            break;
+         }
+      }
+      if ( 0 == s_szX86BoardName[0] )
+         strcpy(s_szX86BoardName, "x86_64");
+   }
+   return s_szX86BoardName;
+}
+#endif
+
 const char* str_get_hardware_board_name(u32 board_type)
 {
    static const char* s_szBoardTypeUnknown = "Unknown";
@@ -852,6 +882,10 @@ const char* str_get_hardware_board_name(u32 board_type)
          default: return s_szBoardTypeOpenIPCSigmasterGeneric;
       }
    }
+#if defined(HW_PLATFORM_X64)
+   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_GENERIC_X86 )
+      return _str_get_x86_board_name();
+#endif
    return s_szBoardTypeUnknown;
 }
 
@@ -937,6 +971,10 @@ const char* str_get_hardware_board_name_short(u32 board_type)
       }
    }
 
+#if defined(HW_PLATFORM_X64)
+   if ( (board_type & BOARD_TYPE_MASK) == BOARD_TYPE_GENERIC_X86 )
+      return _str_get_x86_board_name();
+#endif
    return s_szBoardSTypeUnknown;
 }
 

@@ -765,16 +765,25 @@ void alarms_add_from_local(u32 uAlarms, u32 uFlags1, u32 uFlags2)
 
    if ( uAlarms & ALARM_ID_CONTROLLER_LOW_STORAGE_SPACE )
    {
-       sprintf(szAlarmText, "Controller is running low on free storage space. %u Mb free.", uFlags1);  
-       strcpy(szAlarmText2, "Try to delete your controller logs or some media files or check your SD card."); 
+       sprintf(szAlarmText, "Controller is running low on free storage space. %u Mb free.", uFlags1);
+#if defined(HW_PLATFORM_X64)
+       strcpy(szAlarmText2, "Try to delete your controller logs or some media files to free up disk space.");
+#else
+       strcpy(szAlarmText2, "Try to delete your controller logs or some media files or check your SD card.");
+#endif
        if ( hardware_is_running_on_runcam_vrx() )
           hardware_led_red_set_blinking_fast(10000);
    }
 
    if ( uAlarms & ALARM_ID_CONTROLLER_STORAGE_WRITE_ERRROR )
    {
-       strcpy(szAlarmText, "The SD card on the controller has write errors.");  
-       strcpy(szAlarmText2, "It's recommended you replace the SD card."); 
+#if defined(HW_PLATFORM_X64)
+       strcpy(szAlarmText, "The controller has disk write errors.");
+       strcpy(szAlarmText2, "Check free space and filesystem health on the controller's drive.");
+#else
+       strcpy(szAlarmText, "The SD card on the controller has write errors.");
+       strcpy(szAlarmText2, "It's recommended you replace the SD card.");
+#endif
    }
 
    if ( uAlarms & ALARM_ID_RECEIVED_INVALID_RADIO_PACKET )

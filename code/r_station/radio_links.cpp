@@ -73,6 +73,7 @@ void radio_links_reinit_radio_interfaces()
 
    hardware_radio_remove_stored_config();
    
+#if !defined(HW_PLATFORM_X64)
    hw_execute_bash_command("/etc/init.d/udev restart", NULL);
    hardware_sleep_ms(200);
    hw_execute_bash_command("sudo systemctl restart networking", NULL);
@@ -88,6 +89,10 @@ void radio_links_reinit_radio_interfaces()
    hw_execute_bash_command("sudo ip link", NULL);
 
    hardware_sleep_ms(50);
+
+#else
+   log_line("x64_skip_net_reinit");
+#endif
 
    if ( NULL != g_pProcessStats )
    {
@@ -163,6 +168,11 @@ void radio_links_reinit_radio_interfaces()
    hardware_sleep_ms(100);
    hardware_reset_radio_enumerated_flag();
    hardware_enumerate_radio_interfaces();
+
+   // The interface(s) have just been re-opened/re-enumerated. Clear any stale "broken" flags so the
+   // RX thread resumes reading them; otherwise a one-time broken mark would make periodic_loop keep
+   // calling this reinit forever (the flag was only ever cleared at RX-thread startup before).
+   radio_rx_reset_interfaces_broken_state();
 
    hardware_save_radio_info();
    hardware_sleep_ms(100);
@@ -271,7 +281,17 @@ void radio_links_compute_auto_radio_interfaces_assignment(int iVehicleRadioLink)
 
    log_line("Vehicle has %d active (enabled and not relay) radio links (out of %d radio links)", iCountVehicleActiveUsableRadioLinks, g_pCurrentModel->radioLinksParams.links_count);
    if ( -1 == iStoredMainRadioLinkForModel )
+   {
       log_line("Could not find vehicle's main connect radio link for vehicle, main connect frequency is: %s", str_format_frequency(uStoredMainFrequencyForModel));
+      if ( (uConnectFirstUsableFrequency > 0) && (g_pCurrentModel->uVehicleId != 0) )
+      {
+         log_line("Resetting main connect frequency for VID %u to vehicle radio link %d (%s).",
+            g_pCurrentModel->uVehicleId, iConnectFirstUsableRadioLinkId+1, str_format_frequency(uConnectFirstUsableFrequency));
+         set_model_main_connect_frequency(g_pCurrentModel->uVehicleId, uConnectFirstUsableFrequency);
+         uStoredMainFrequencyForModel = uConnectFirstUsableFrequency;
+         iStoredMainRadioLinkForModel = iConnectFirstUsableRadioLinkId;
+      }
+   }
    else
       log_line("Found vehicle's main connect radio link for frequency %s: vehicle radio link %d", str_format_frequency(uStoredMainFrequencyForModel), iStoredMainRadioLinkForModel+1);
 
@@ -679,7 +699,90 @@ void radio_links_open_rxtx_radio_interfaces_for_search( u32 uSearchFreq )
       g_SM_RadioStats.radio_interfaces[i].openedForWrite = 0;
    }
 
+   radio_close_interfaces_for_read();
+#if defined(HW_PLATFORM_X64)
+   radio_reset_x64_rx_debug_stats();
+#endif
+
+#if defined(HW_PLATFORM_X64)
+   // rtw88/Alfa: one tune path only — down/monitor/freq/up then pcap (no pre-tune, no wlan0).
+   {
+      Preferences* pP = get_Preferences();
+      u32 delayMs = DEFAULT_DELAY_WIFI_CHANGE;
+      if ( NULL != pP )
+         delayMs = (u32) pP->iDebugWiFiChangeDelay;
+      if ( delayMs<1 || delayMs > 200 )
+         delayMs = DEFAULT_DELAY_WIFI_CHANGE;
+
+      log_line("Links: x64 search tune to %s (Alfa/high-cap only)", str_format_frequency(uSearchFreq));
+      for( int i=0; i<hardware_get_radio_interfaces_count(); i++ )
+      {
+         radio_hw_info_t* pRadioHWInfo = hardware_get_radio_info(i);
+         if ( NULL == pRadioHWInfo )
+            continue;
+         if ( ! hardware_radio_is_wifi_radio(pRadioHWInfo) )
+            continue;
+         if ( ! pRadioHWInfo->isHighCapacityInterface )
+         {
+            log_line("Links: x64 search skip radio interface %d (%s) — not high-capacity", i+1, pRadioHWInfo->szName);
+            continue;
+         }
+         u32 flags = controllerGetCardFlags(pRadioHWInfo->szMAC);
+         if ( (flags & RADIO_HW_CAPABILITY_FLAG_DISABLED) || controllerIsCardDisabled(pRadioHWInfo->szMAC) )
+            continue;
+         if ( 0 == hardware_radio_supports_frequency(pRadioHWInfo, uSearchFreq) )
+            continue;
+         if ( ! (flags & RADIO_HW_CAPABILITY_FLAG_CAN_RX) )
+            continue;
+
+         u32 uFreqWifi = uSearchFreq / 1000;
+         char szComm[256];
+         char szOut[256];
+         szOut[0] = 0;
+
+         sprintf(szComm, "sudo -n iw dev %s info 2>&1", pRadioHWInfo->szName);
+         hw_execute_bash_command(szComm, szOut);
+         bool bAlreadyMonitor = (NULL != strstr(szOut, "type monitor"));
+
+         if ( ! bAlreadyMonitor )
+         {
+            szOut[0] = 0;
+            sprintf(szComm, "sudo -n ip link set %s down 2>&1", pRadioHWInfo->szName);
+            hw_execute_bash_command(szComm, szOut);
+            hardware_sleep_ms(delayMs);
+
+            sprintf(szComm, "sudo -n iw dev %s set type monitor 2>&1", pRadioHWInfo->szName);
+            hw_execute_bash_command(szComm, szOut);
+            if ( strlen(szOut) > 3 )
+               log_line("Links: x64 iw monitor %s: [%s]", pRadioHWInfo->szName, szOut);
+            hardware_sleep_ms(delayMs);
+         }
+
+         sprintf(szComm, "sudo -n ip link set %s up 2>&1", pRadioHWInfo->szName);
+         hw_execute_bash_command(szComm, szOut);
+         hardware_sleep_ms(delayMs < 150 ? 150 : delayMs);
+
+         szOut[0] = 0;
+         sprintf(szComm, "sudo -n iw dev %s set freq %u HT20 2>&1", pRadioHWInfo->szName, uFreqWifi);
+         hw_execute_bash_command(szComm, szOut);
+         if ( strlen(szOut) > 3 )
+            log_line("Links: x64 iw freq %s: [%s]", pRadioHWInfo->szName, szOut);
+         hardware_sleep_ms(delayMs);
+
+         szOut[0] = 0;
+         sprintf(szComm, "sudo -n iw dev %s set freq %u HT20 2>&1", pRadioHWInfo->szName, uFreqWifi);
+         hw_execute_bash_command(szComm, szOut);
+         if ( strlen(szOut) > 3 )
+            log_line("Links: x64 iw re-freq %s: [%s]", pRadioHWInfo->szName, szOut);
+         hardware_sleep_ms(100);
+
+         radio_stats_set_card_current_frequency(&g_SM_RadioStats, i, uSearchFreq);
+         pRadioHWInfo->uCurrentFrequencyKhz = uSearchFreq;
+      }
+   }
+#else
    radio_links_set_monitor_mode();
+#endif
 
    s_iFailedInitRadioInterface = -1;
 
@@ -691,6 +794,11 @@ void radio_links_open_rxtx_radio_interfaces_for_search( u32 uSearchFreq )
       radio_hw_info_t* pRadioHWInfo = hardware_get_radio_info(i);
       if ( NULL == pRadioHWInfo )
          continue;
+#if defined(HW_PLATFORM_X64)
+      // Search uses Alfa/high-cap only; skip internal wlan0 and other non-Alfa cards.
+      if ( ! pRadioHWInfo->isHighCapacityInterface )
+         continue;
+#endif
       u32 flags = controllerGetCardFlags(pRadioHWInfo->szMAC);
       if ( (flags & RADIO_HW_CAPABILITY_FLAG_DISABLED) || controllerIsCardDisabled(pRadioHWInfo->szMAC) )
          continue;
@@ -775,7 +883,10 @@ void radio_links_open_rxtx_radio_interfaces_for_search( u32 uSearchFreq )
    }
    log_line("OPEN RADIO INTERFACES END =====================================================================");
    log_line("");
+#if !defined(HW_PLATFORM_X64)
+   // Re-applying monitor mode after pcap_open invalidates the capture handle on rtw88.
    radio_links_set_monitor_mode();
+#endif
 }
 
 void radio_links_open_rxtx_radio_interfaces()
@@ -1380,12 +1491,38 @@ void radio_links_set_monitor_mode()
       if ( ! hardware_radio_is_wifi_radio(pRadioHWInfo) )
          continue;
 
-      #ifdef HW_PLATFORM_RADXA
-      char szComm[128];
-      //sprintf(szComm, "iwconfig %s mode monitor 2>&1", pRadioHWInfo->szName );
-      //hw_execute_bash_command(szComm, NULL);
-      //hardware_sleep_ms(uDelayMS);
+      #if defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_X64)
+      char szComm[256];
+      #if defined(HW_PLATFORM_X64)
+      char szOutput[512];
+      szOutput[0] = 0;
+      sprintf(szComm, "iw dev %s info 2>&1", pRadioHWInfo->szName);
+      hw_execute_bash_command(szComm, szOutput);
+      if ( NULL != strstr(szOutput, "type monitor") )
+      {
+         // rtw88: recycling monitor down/up breaks data-frame RX; only ensure link is up.
+         sprintf(szComm, "sudo -n ip link set %s up 2>&1", pRadioHWInfo->szName);
+         hw_execute_bash_command(szComm, NULL);
+         hardware_sleep_ms(uDelayMS);
+         continue;
+      }
+      sprintf(szComm, "sudo -n ip link set %s down 2>&1", pRadioHWInfo->szName);
+      #else
+      sprintf(szComm, "ip link set %s down 2>&1", pRadioHWInfo->szName);
+      #endif
+      hw_execute_bash_command(szComm, NULL);
+      hardware_sleep_ms(uDelayMS);
 
+      #if defined(HW_PLATFORM_X64)
+      // x64 simple monitor (no none/fcsfail): rtw88 matches ruby_rf_scan --setup
+      sprintf(szComm, "sudo -n iw dev %s set type monitor 2>&1", pRadioHWInfo->szName);
+      #else
+      sprintf(szComm, "iw dev %s set type monitor 2>&1", pRadioHWInfo->szName);
+      #endif
+      hw_execute_bash_command(szComm, NULL);
+      hardware_sleep_ms(uDelayMS);
+
+      #if !defined(HW_PLATFORM_X64)
       sprintf(szComm, "iw dev %s set monitor none 2>&1", pRadioHWInfo->szName);
       hw_execute_bash_command(szComm, NULL);
       hardware_sleep_ms(uDelayMS);
@@ -1395,13 +1532,11 @@ void radio_links_set_monitor_mode()
       hardware_sleep_ms(uDelayMS);
       #endif
 
-      #ifdef HW_PLATFORM_RASPBERRY
-      char szComm[128];
-      sprintf(szComm, "iw dev %s set monitor none 2>&1", pRadioHWInfo->szName);
-      hw_execute_bash_command(szComm, NULL);
-      hardware_sleep_ms(uDelayMS);
-
-      sprintf(szComm, "iw dev %s set monitor fcsfail 2>&1", pRadioHWInfo->szName);
+      #if defined(HW_PLATFORM_X64)
+      sprintf(szComm, "sudo -n ip link set %s up 2>&1", pRadioHWInfo->szName);
+      #else
+      sprintf(szComm, "ip link set %s up 2>&1", pRadioHWInfo->szName);
+      #endif
       hw_execute_bash_command(szComm, NULL);
       hardware_sleep_ms(uDelayMS);
       #endif

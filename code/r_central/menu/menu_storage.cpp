@@ -102,17 +102,23 @@ void MenuStorage::onShow()
    
    media_scan_files();
 
-   #if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA)
+   #if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    sprintf(szComm, "df -m %s | tail -n 1", FOLDER_MEDIA);
+   #else
+   szComm[0] = 0;
    #endif
 
-   if ( 1 == hw_execute_bash_command_raw(szComm, szBuff) )
+   long lb = 0, lu = 0, lf = 0;
+   if ( (0 != szComm[0]) && (1 == hw_execute_bash_command_raw(szComm, szBuff)) )
    {
       char szTemp[1024];
-      long lb, lu, lf;
-      sscanf(szBuff, "%s %ld %ld %ld", szTemp, &lb, &lu, &lf);
-      m_MemUsed = lu;
-      m_MemFree = lf;
+      szTemp[0] = 0;
+      // df data line: <fs> <1M-blocks> <used> <available> <use%> <mount>
+      if ( 4 == sscanf(szBuff, "%s %ld %ld %ld", szTemp, &lb, &lu, &lf) )
+      {
+         m_MemUsed = lu;
+         m_MemFree = lf;
+      }
    }
 
    ruby_signal_alive();

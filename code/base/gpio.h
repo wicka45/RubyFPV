@@ -79,6 +79,30 @@
 #define GPIO_PIN_BUZZER -1
 #endif
 
+#ifdef HW_PLATFORM_X64
+// x64 desktop ground station: no physical GPIO buttons/LEDs. All pins disabled.
+
+#define GPIO_PIN_MENU -1
+#define GPIO_PIN_BACK -1
+#define GPIO_PIN_PLUS -1
+#define GPIO_PIN_MINUS -1
+
+#define GPIO_PIN_QACTION1 -1
+#define GPIO_PIN_QACTION2 -1
+#define GPIO_PIN_QACTION2_2 -1
+#define GPIO_PIN_QACTION3 -1
+#define GPIO_PIN_QACTIONPLUS -1
+#define GPIO_PIN_QACTIONMINUS -1
+
+
+#define GPIO_PIN_DETECT_TYPE_VEHICLE -1
+#define GPIO_PIN_DETECT_TYPE_CONTROLLER -1
+
+#define GPIO_PIN_LED_RED -1
+#define GPIO_PIN_LED_GREEN -1
+#define GPIO_PIN_BUZZER -1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif 

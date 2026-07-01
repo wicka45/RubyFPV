@@ -710,6 +710,12 @@ u32 hardware_detectBoardType()
    _hardware_detect_board_openipc(szBoardId);
    #endif
 
+   #if defined (HW_PLATFORM_X64)
+   // Generic x86_64 desktop/laptop ground station. The actual machine name (e.g. "MacBookAir4,2")
+   // is resolved from DMI/SMBIOS in str_get_hardware_board_name() for display.
+   s_uHardwareBoardType = BOARD_TYPE_GENERIC_X86;
+   #endif
+
    char szBoardName[128];
    strncpy(szBoardName, str_get_hardware_board_name(s_uHardwareBoardType), 127);
    if ( szBoardName[0] == 0 )
@@ -2166,6 +2172,23 @@ int hardware_get_cpu_speed()
    return iFreqMhz;
    #endif
 
+   #if defined(HW_PLATFORM_X64)
+   {
+      char szOutput[256];
+      szOutput[0] = 0;
+      hw_execute_bash_command_raw_silent("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null", szOutput);
+      int iKhz = atoi(szOutput);
+      if ( iKhz > 0 )
+         return iKhz/1000;
+      // Fallback for systems without cpufreq sysfs: current MHz from /proc/cpuinfo.
+      szOutput[0] = 0;
+      hw_execute_bash_command_raw_silent("awk -F: '/cpu MHz/{print int($2); exit}' /proc/cpuinfo 2>/dev/null", szOutput);
+      int iMhz = atoi(szOutput);
+      if ( iMhz > 0 )
+         return iMhz;
+   }
+   #endif
+
    return 1000;
 }
 
@@ -2262,7 +2285,42 @@ int hardware_get_cpu_temp()
    iTemp1 = 1000 * atoi(szBuff);
    #endif
 
-   return iTemp1/1000;    
+   #if defined(HW_PLATFORM_X64)
+   {
+      char szOutput[256];
+      szOutput[0] = 0;
+      // On x86 laptops thermal_zone0 is often the battery/ACPI zone, so pick the CPU package zone
+      // (x86_pkg_temp) explicitly; fall back to the coretemp hwmon. Both report millidegrees C.
+      hw_execute_bash_command_raw_silent("for z in /sys/class/thermal/thermal_zone*; do if [ \"$(cat $z/type 2>/dev/null)\" = \"x86_pkg_temp\" ]; then cat $z/temp 2>/dev/null; break; fi; done", szOutput);
+      iTemp1 = atoi(szOutput);
+      if ( iTemp1 <= 0 )
+      {
+         szOutput[0] = 0;
+         hw_execute_bash_command_raw_silent("for h in /sys/class/hwmon/hwmon*; do if [ \"$(cat $h/name 2>/dev/null)\" = \"coretemp\" ]; then cat $h/temp1_input 2>/dev/null; break; fi; done", szOutput);
+         iTemp1 = atoi(szOutput);
+      }
+   }
+   #endif
+
+   return iTemp1/1000;
+}
+
+int hardware_get_gs_battery_percent()
+{
+   #if defined(HW_PLATFORM_X64)
+   // Laptop/desktop ground stations expose a battery via /sys/class/power_supply/BAT*/capacity.
+   char szOutput[64];
+   szOutput[0] = 0;
+   hw_execute_bash_command_raw_silent("cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1", szOutput);
+   if ( 0 == szOutput[0] )
+      return -1;   // no battery (e.g. desktop)
+   int iCap = atoi(szOutput);
+   if ( iCap < 0 ) iCap = 0;
+   if ( iCap > 100 ) iCap = 100;
+   return iCap;
+   #else
+   return -1;
+   #endif
 }
 
 void hardware_set_oipc_freq_boost(int iFreqCPUMhz, int iGPUBoost)

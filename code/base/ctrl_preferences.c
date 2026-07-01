@@ -39,7 +39,7 @@
 
 #define PREFERENCES_SETTINGS_STAMP_ID "vIV.3"
 
-#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA)
+#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 
 Preferences s_Preferences;
 
@@ -94,7 +94,15 @@ void reset_Preferences()
    s_Preferences.iDebugRestartOnRadioSilence = 0;
    s_Preferences.iOSDFont = 1;
    s_Preferences.iPersistentMessages = 1;
+   // x64 ground stations default to errors-only logging: log_line does an fopen/write/fclose per
+   // call, and hot-path logs (e.g. per-packet retransmission discards) make full logging a real
+   // latency source. Other platforms keep full logging by default. User can still switch in
+   // System > Developer > Logs.
+#if defined(HW_PLATFORM_X64)
+   s_Preferences.nLogLevel = 1;
+#else
    s_Preferences.nLogLevel = 0;
+#endif
    s_Preferences.iDebugShowDevVideoStats = 0;
    s_Preferences.iDebugShowDevRadioStats = 0;
    s_Preferences.iDebugShowFullRXStats = 0;
@@ -139,6 +147,8 @@ void reset_Preferences()
    #endif
 
    s_Preferences.iShowCompactMenus = 1;
+   s_Preferences.iMenusTransparency = 1;
+   s_Preferences.iShowGSBattery = 0;
    s_Preferences.uEnabledQuickMenu = 0xFFFFFFFF;
 }
 
@@ -217,6 +227,8 @@ int save_Preferences()
    fprintf(fd, "%d %d %d\n", s_Preferences.iMSPOSDSize, s_Preferences.iMSPOSDDeltaX, s_Preferences.iMSPOSDDeltaY);
    fprintf(fd, "%d\n", s_Preferences.iShowCompactMenus);
    fprintf(fd, "%u\n", s_Preferences.uEnabledQuickMenu);
+   fprintf(fd, "%d\n", s_Preferences.iMenusTransparency);
+   fprintf(fd, "%d\n", s_Preferences.iShowGSBattery);
    fclose(fd);
    log_line("Saved preferences to file: %s", szFile);
    return 1;
@@ -443,6 +455,12 @@ int load_Preferences()
 
    if ( bOk && (1 != fscanf(fd, "%u", &s_Preferences.uEnabledQuickMenu)) )
       s_Preferences.uEnabledQuickMenu = 0xFFFFFFFF;
+
+   if ( bOk && (1 != fscanf(fd, "%d", &s_Preferences.iMenusTransparency)) )
+      s_Preferences.iMenusTransparency = 1;
+
+   if ( bOk && (1 != fscanf(fd, "%d", &s_Preferences.iShowGSBattery)) )
+      s_Preferences.iShowGSBattery = 0;
 
    // ----------------------------------------------------
    // End reading file;

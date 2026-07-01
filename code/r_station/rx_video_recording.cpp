@@ -235,7 +235,15 @@ void* _thread_video_recording(void *argument)
    s_bIsRecordingToRAM = false;
 
    Preferences* p = get_Preferences();
-   if ( p->iVideoDestination == prefVideoDestination_Mem )
+   bool bRecordToRAM = (p->iVideoDestination == prefVideoDestination_Mem);
+#if defined(HW_PLATFORM_X64)
+   // x64 records straight to the SSD: it is fast enough to never drop frames, it removes the
+   // RAM-disk size cap (the "df < 20MB -> stop" auto-stop below that produces fixed-size clips),
+   // and it avoids the umount/remount-reuse of the RAM cache that can duplicate a clip. Pi/Radxa
+   // keep the RAM cache to protect their slow/wear-prone SD cards.
+   bRecordToRAM = false;
+#endif
+   if ( bRecordToRAM )
    {
       strcpy(s_szFileRecordingOutput, FOLDER_TEMP_VIDEO_MEM);
       strcat(s_szFileRecordingOutput, FILE_TEMP_VIDEO_MEM_FILE);
@@ -273,7 +281,11 @@ void* _thread_video_recording(void *argument)
    snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "chmod 777 %s", s_szFileRecordingOutput);
    hw_execute_bash_command(szComm, NULL);
 
-   int iOpenFlags = O_CREAT | O_WRONLY;
+   // O_TRUNC: always start from an EMPTY temp file. The temp name is reused across recordings, so
+   // without truncation a recording whose video doesn't get freshly written would finalize the
+   // previous recording's stale data (the byte-identical-duplicate bug). Truncating is always
+   // correct here: the recorder rewrites the file from offset 0 every time.
+   int iOpenFlags = O_CREAT | O_WRONLY | O_TRUNC;
    //if ( RUBY_PIPES_EXTRA_FLAGS & O_NONBLOCK )
    //   iOpenFlags |= O_NONBLOCK;
    s_iFileVideoRecordingOutput = open(s_szFileRecordingOutput, iOpenFlags);
@@ -583,9 +595,13 @@ void rx_video_recording_start()
    log_line("[VideoRecording] Received request to start recording video.");
 
    s_iTempRecordingBufferFilledInBytes = 0;
+   // Sensible defaults so recording never aborts for lack of metadata (the raw H264 carries its own
+   // SPS; these only feed the .info file + ffmpeg container framerate). Only overwrite with the
+   // processor's values when they are valid (>0) - on x64 the router does not decode, so live
+   // decode-stats can be 0; getVideoWidth/Height now fall back to the model resolution.
    s_iRecordingWidth = 1280;
    s_iRecordingHeight = 720;
-   s_iRecordingFPS = 0;
+   s_iRecordingFPS = 30;
    s_iRecordingType = VIDEO_TYPE_H264;
    for( int i=0; i<MAX_VIDEO_PROCESSORS; i++ )
    {
@@ -593,10 +609,14 @@ void rx_video_recording_start()
          break;
       if ( g_pCurrentModel->uVehicleId != g_pVideoProcessorRxList[i]->m_uVehicleId )
          continue;
-      s_iRecordingWidth = g_pVideoProcessorRxList[i]->getVideoWidth();
-      s_iRecordingHeight = g_pVideoProcessorRxList[i]->getVideoHeight();
-      s_iRecordingFPS = g_pVideoProcessorRxList[i]->getVideoFPS();
-      s_iRecordingType = g_pVideoProcessorRxList[i]->getVideoType();
+      int iW = g_pVideoProcessorRxList[i]->getVideoWidth();
+      int iH = g_pVideoProcessorRxList[i]->getVideoHeight();
+      int iFPS = g_pVideoProcessorRxList[i]->getVideoFPS();
+      int iType = g_pVideoProcessorRxList[i]->getVideoType();
+      if ( iW > 0 ) s_iRecordingWidth = iW;
+      if ( iH > 0 ) s_iRecordingHeight = iH;
+      if ( iFPS > 0 ) s_iRecordingFPS = iFPS;
+      if ( iType > 0 ) s_iRecordingType = iType;
       log_line("[VideoRecording] Found info for VID %u: w/h/fps: %dx%d@%d, type: %d", g_pCurrentModel->uVehicleId, s_iRecordingWidth, s_iRecordingHeight, s_iRecordingFPS, s_iRecordingType);
       break;
    }

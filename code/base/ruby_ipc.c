@@ -75,7 +75,13 @@ static int s_iRubyIPCCountReadErrors = 0;
 typedef struct
 {
     long type;
-    char data[IPC_CHANNEL_MAX_MSG_SIZE];
+    // NOTE: must be UNSIGNED. On x86-64 plain `char` is signed (it is unsigned by default on the
+    // ARM/MIPS targets), so reading the length bytes (data[5..6]) and msg-id (data[4]) below would
+    // sign-extend any byte >= 0x80 to a negative value. That silently corrupted the decoded message
+    // length for larger IPC messages (e.g. the model-settings zip segments router->central), which
+    // were then dropped as "invalid message length" or failed CRC -> the vehicle-settings sync looped
+    // forever. The CRC/memcpy reads already cast to (u8*); only the bare data[4..6] reads were affected.
+    u8 data[IPC_CHANNEL_MAX_MSG_SIZE];
     // byte 0...3: CRC
     // byte 4: message type
     // byte 5..6: message data length
@@ -217,6 +223,19 @@ int ruby_init_ipc_channels()
 
    sprintf(szBuff, "mkfifo %s", FIFO_RUBY_STATION_VIDEO_STREAM_ETH);
    hw_execute_bash_command(szBuff, NULL);
+   #endif
+
+   #if defined(HW_PLATFORM_X64)
+   // x64 GS: the RPi/Radxa block above is compiled out, but the live FPV audio path still needs its
+   // three named FIFOs. Create just those (video/eth FIFOs are handled differently on x64).
+   char szBuffX64[256];
+   hw_execute_bash_command("mkdir -p /tmp/ruby 2>/dev/null", NULL);
+   sprintf(szBuffX64, "mkfifo %s 2>/dev/null", FIFO_RUBY_AUDIO1);
+   hw_execute_bash_command(szBuffX64, NULL);
+   sprintf(szBuffX64, "mkfifo %s 2>/dev/null", FIFO_RUBY_AUDIO_BUFF);
+   hw_execute_bash_command(szBuffX64, NULL);
+   sprintf(szBuffX64, "mkfifo %s 2>/dev/null", FIFO_RUBY_AUDIO_QUEUE);
+   hw_execute_bash_command(szBuffX64, NULL);
    #endif
 
    #ifdef RUBY_USE_FIFO_PIPES

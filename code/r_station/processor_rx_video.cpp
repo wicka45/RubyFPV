@@ -372,7 +372,10 @@ int ProcessorRxVideo::getVideoWidth()
       if ( (0 != g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoWidth) && (0 != g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoHeight) )
          iVideoWidth = g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoWidth;
    }
-   else
+   // On x64 the router does not decode the stream (the gstreamer player does), so the live decode
+   // stats stay 0. Fall back to the model's configured resolution (same pattern as getVideoFPS)
+   // so DVR recording can obtain valid dimensions instead of aborting.
+   if ( 0 == iVideoWidth )
    {
       Model* pModel = findModelWithId(m_uVehicleId, 177);
       if ( NULL != pModel )
@@ -389,7 +392,7 @@ int ProcessorRxVideo::getVideoHeight()
       if ( (0 != g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoWidth) && (0 != g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoHeight) )
          iVideoHeight = g_SM_VideoDecodeStats.video_streams[m_iIndexVideoDecodeStats].iCurrentVideoHeight;
    }
-   else
+   if ( 0 == iVideoHeight )
    {
       Model* pModel = findModelWithId(m_uVehicleId, 177);
       if ( NULL != pModel )
@@ -485,22 +488,37 @@ void ProcessorRxVideo::handleReceivedVideoRetrPacket(int interfaceNb, u8* pBuffe
 
    bool bDiscard = false;
    bool bBeforeResChange = false;
+   // Rate-limit the per-packet discard logs below. When retransmissions arrive after the block was
+   // already output (the buffer advanced), this path can fire thousands of times/min; since log_line
+   // does an fopen/write/fclose per call, unthrottled it becomes its own latency source in the RX
+   // path (and feeds the late-retransmission loop). The discard COUNTER stays exact; only the log is
+   // throttled to ~1/sec.
+   static u32 s_uLastRetrDiscardLogTime = 0;
+   bool bLogRetrDiscard = ( g_TimeNow > s_uLastRetrDiscardLogTime + 1000 );
    if ( pPHVS->uStreamInfo > m_uRequestRetransmissionUniqueId )
    {
       g_SMControllerRTInfo.uOutputedVideoPacketsRetransmittedDiscarded[g_SMControllerRTInfo.iCurrentIndex]++;
-      log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's before retr state reset (oldest video block in video rx buffer: %u, last retr id: %u)",
+      if ( bLogRetrDiscard )
+      {
+         s_uLastRetrDiscardLogTime = g_TimeNow;
+         log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's before retr state reset (oldest video block in video rx buffer: %u, last retr id: %u)",
             pPHVS->uH264FrameIndex, pPHVS->uCurrentBlockIndex, pPHVS->uCurrentBlockPacketIndex,
             pPHVS->uVideoStatusFlags2 & VIDEO_STATUS_FLAGS2_MASK_EOF_COUNTER,
             pPHVS->uStreamInfo, m_pVideoRxBuffer->getBufferBottomVideoBlockIndex(), m_uRequestRetransmissionUniqueId);
+      }
       bDiscard = true;
    }
    else if ( (m_pVideoRxBuffer->getBufferBottomIndex() != -1) && (m_pVideoRxBuffer->getBufferBottomVideoBlockIndex() != 0) && (pPHVS->uCurrentBlockIndex < m_pVideoRxBuffer->getBufferBottomVideoBlockIndex()) )
    {
       g_SMControllerRTInfo.uOutputedVideoPacketsRetransmittedDiscarded[g_SMControllerRTInfo.iCurrentIndex]++;
-      log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's too old (oldest video block in video rx buffer: %u)",
+      if ( bLogRetrDiscard )
+      {
+         s_uLastRetrDiscardLogTime = g_TimeNow;
+         log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's too old (oldest video block in video rx buffer: %u)",
             pPHVS->uH264FrameIndex, pPHVS->uCurrentBlockIndex, pPHVS->uCurrentBlockPacketIndex,
             pPHVS->uVideoStatusFlags2 & VIDEO_STATUS_FLAGS2_MASK_EOF_COUNTER,
             pPHVS->uStreamInfo, m_pVideoRxBuffer->getBufferBottomVideoBlockIndex());
+      }
       bDiscard = true;
    }
    else if ( m_pVideoRxBuffer->hasVideoPacket(pPHVS->uCurrentBlockIndex, pPHVS->uCurrentBlockPacketIndex) ||
@@ -508,10 +526,14 @@ void ProcessorRxVideo::handleReceivedVideoRetrPacket(int interfaceNb, u8* pBuffe
         (pPHVS->uCurrentBlockIndex < m_LastOutputedVideoPacketInfo.uCurrentBlockIndex) )
    {
       g_SMControllerRTInfo.uOutputedVideoPacketsRetransmittedDiscarded[g_SMControllerRTInfo.iCurrentIndex]++;
-      log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's already received or outputed.",
+      if ( bLogRetrDiscard )
+      {
+         s_uLastRetrDiscardLogTime = g_TimeNow;
+         log_line("[ProcessorRxVideo] Discard retr video pckt [f%d %u/%u eof %d] (part of retr id %u) as it's already received or outputed.",
             pPHVS->uH264FrameIndex, pPHVS->uCurrentBlockIndex, pPHVS->uCurrentBlockPacketIndex,
             pPHVS->uVideoStatusFlags2 & VIDEO_STATUS_FLAGS2_MASK_EOF_COUNTER,
             pPHVS->uStreamInfo);
+      }
       bDiscard = true;
    }
 
@@ -710,13 +732,19 @@ void ProcessorRxVideo::_checkAndOutputAvailablePackets(type_global_state_vehicle
 
 void ProcessorRxVideo::processAndOutputVideoPacket(type_rx_video_block_info* pVideoBlock, type_rx_video_packet_info* pVideoPacket, bool bWaitFullFrame)
 {
+   // Guard against NULL packet pointers (missing / EC-reconstructed slots in a block).
+   // Dereferencing these (pPHVS memcpy below, pPHVSImp->uVideoDataLength in the H264 parse path)
+   // was crashing ruby_rt_station; the watchdog then restarted it -> link + FC telemetry drops.
+   if ( (NULL == pVideoPacket) || (NULL == pVideoBlock)
+        || (NULL == pVideoPacket->pPHVS) || (NULL == pVideoPacket->pPHVSImp) || (NULL == pVideoPacket->pVideoData) )
+      return;
    t_packet_header_video_segment* pPHVS = pVideoPacket->pPHVS;
    t_packet_header_video_segment_important* pPHVSImp = pVideoPacket->pPHVSImp;
    u8* pVideoRawStreamData = pVideoPacket->pVideoData;
    pVideoRawStreamData += sizeof(t_packet_header_video_segment_important);
 
 
-   if ( g_pControllerSettings->iEnableDebugStats ||
+   if ( ((NULL != g_pControllerSettings) && g_pControllerSettings->iEnableDebugStats) ||
         ((NULL != g_pCurrentModel) && (g_pCurrentModel->osd_params.osd_flags2[g_pCurrentModel->osd_params.iCurrentOSDScreen] & OSD_FLAG2_SHOW_VIDEO_FRAMES_STATS)) )
       _updateDebugStatsOnVideoPacket(pVideoPacket);
 
@@ -1041,6 +1069,10 @@ void ProcessorRxVideo::_checkUpdateRetransmissionsState()
 }
 
 
+// x64/fast-loop fix: minimum ms before re-requesting the SAME missing video packet.
+// Without this, a fast main loop re-requests every ~10ms while a retransmission takes ~40-50ms
+// to round-trip, multiplying the vehicle's retransmission TX into airtime overload -> collapse.
+static const u32 s_uRetransReRequestMinGapMs = 30;
 int ProcessorRxVideo::checkAndRequestMissingPackets(bool bForceSyncNow)
 {
    /*
@@ -1228,7 +1260,11 @@ int ProcessorRxVideo::checkAndRequestMissingPackets(bool bForceSyncNow)
             continue;
 
          if ( 0 != pVideoBlock->packets[k].uRequestedTime )
+         {
+            if ( g_TimeNow < pVideoBlock->packets[k].uRequestedTime + s_uRetransReRequestMinGapMs )
+               continue;
             bContainsReRequestedPackets = true;
+         }
          pVideoBlock->packets[k].uRequestedTime = g_TimeNow;
          uLastRequestedVideoBlockIndex = pVideoBlock->uVideoBlockIndex;
          iLastRequestedVideoBlockPacketIndex = k;
@@ -1287,7 +1323,11 @@ int ProcessorRxVideo::checkAndRequestMissingPackets(bool bForceSyncNow)
                continue;
 
             if ( 0 != pVideoBlock->packets[k].uRequestedTime )
+            {
+               if ( g_TimeNow < pVideoBlock->packets[k].uRequestedTime + s_uRetransReRequestMinGapMs )
+                  continue;
                bContainsReRequestedPackets = true;
+            }
             pVideoBlock->packets[k].uRequestedTime = g_TimeNow;
             uLastRequestedVideoBlockIndex = pVideoBlock->uVideoBlockIndex;
             iLastRequestedVideoBlockPacketIndex = k;

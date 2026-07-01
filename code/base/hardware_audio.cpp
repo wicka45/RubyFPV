@@ -37,6 +37,7 @@
 #include "hardware_procs.h"
 #include <ctype.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 static bool s_bHardwareDetectedAudioDevices = false;
 static bool s_bHardwareAudioHasAudioPlayback = false;
@@ -44,6 +45,7 @@ static bool s_bHardwareAudioHasAudioSwitch = false;
 static bool s_bHardwareAudioHasAudioVolume = false;
 static int  s_iHardwareAudiotSwitchControlId = -1;
 static int  s_iHardwareAudioVolumeControlId = -1;
+static char s_szHardwareAudioPlaybackDevice[128] = {0};   // x64: ALSA -D device (e.g. plughw:CARD=PCH,DEV=0); empty elsewhere
 
 void _hardware_audio_enumerate_capabilities()
 {
@@ -98,6 +100,40 @@ void _hardware_audio_enumerate_capabilities()
       pszLine = strtok(NULL, "\n");
    }
    #endif
+
+   #if defined(HW_PLATFORM_X64)
+   // x64 GS: pick an ALSA hardware playback device and remember it so aplay can target it with -D.
+   // The GS runs as root from tty1 with NO PipeWire session, so the ALSA "default" PCM (which routes
+   // to PipeWire on modern desktops) is unreachable ("Host is down"). Prefer the first ANALOG
+   // (non-HDMI) playback card, fall back to the first playback card of any kind. Pick by CARD NAME
+   // (robust to kernel card reordering across boots/laptops). Override with env RUBY_AUDIO_DEV.
+   s_szHardwareAudioPlaybackDevice[0] = 0;
+   const char* pEnvAudioDev = getenv("RUBY_AUDIO_DEV");
+   if ( (NULL != pEnvAudioDev) && (0 != pEnvAudioDev[0]) )
+   {
+      strncpy(s_szHardwareAudioPlaybackDevice, pEnvAudioDev, sizeof(s_szHardwareAudioPlaybackDevice)-1);
+      s_szHardwareAudioPlaybackDevice[sizeof(s_szHardwareAudioPlaybackDevice)-1] = 0;
+   }
+   else
+   {
+      char szOutX64[512];
+      szOutX64[0] = 0;
+      hw_execute_bash_command_raw("aplay -l 2>/dev/null | grep -iE 'device [0-9]+:' | grep -viE 'HDMI|Digital' | head -1 | sed -E 's/^card [0-9]+: ([^ ]+) .*device ([0-9]+):.*/plughw:CARD=\\1,DEV=\\2/'", szOutX64);
+      if ( 0 == szOutX64[0] )
+         hw_execute_bash_command_raw("aplay -l 2>/dev/null | grep -iE 'device [0-9]+:' | head -1 | sed -E 's/^card [0-9]+: ([^ ]+) .*device ([0-9]+):.*/plughw:CARD=\\1,DEV=\\2/'", szOutX64);
+      int iLenX64 = (int)strlen(szOutX64);
+      while ( (iLenX64 > 0) && ((szOutX64[iLenX64-1] == '\n') || (szOutX64[iLenX64-1] == '\r') || (szOutX64[iLenX64-1] == ' ')) )
+         szOutX64[--iLenX64] = 0;
+      if ( iLenX64 > 0 )
+      {
+         strncpy(s_szHardwareAudioPlaybackDevice, szOutX64, sizeof(s_szHardwareAudioPlaybackDevice)-1);
+         s_szHardwareAudioPlaybackDevice[sizeof(s_szHardwareAudioPlaybackDevice)-1] = 0;
+      }
+   }
+   if ( 0 != s_szHardwareAudioPlaybackDevice[0] )
+      s_bHardwareAudioHasAudioPlayback = true;
+   log_line("[HardwareAudio] x64 audio playback device: [%s] (playback: %s)", s_szHardwareAudioPlaybackDevice, s_bHardwareAudioHasAudioPlayback?"yes":"no");
+   #endif
    log_line("[HardwareAudio] Done detecting capabilites.");
 }
 
@@ -120,6 +156,58 @@ bool hardware_has_audio_playback()
       _hardware_audio_enumerate_capabilities();
    return s_bHardwareAudioHasAudioPlayback;
 }
+
+// x64: the autodetected ALSA -D device string (e.g. "plughw:CARD=PCH,DEV=0"); "" on Pi/Radxa.
+const char* hardware_audio_get_playback_device()
+{
+   if ( ! s_bHardwareDetectedAudioDevices )
+      _hardware_audio_enumerate_capabilities();
+   return s_szHardwareAudioPlaybackDevice;
+}
+
+#if defined(HW_PLATFORM_X64)
+// System (ALSA hardware-mixer) volume control for the x64 GS, driven by the laptop's volume keys.
+// iDeltaPercent: 0 = mute toggle, >0 = raise N%, <0 = lower N%. Targets the detected card and tries
+// the common master controls in order (portable across codecs: CS4208/Realtek/etc.).
+void hardware_audio_system_volume_step(int iDeltaPercent)
+{
+   if ( ! s_bHardwareDetectedAudioDevices )
+      _hardware_audio_enumerate_capabilities();
+
+   // Derive the ALSA card selector from the detected device ("plughw:CARD=PCH,DEV=0" -> "-c PCH").
+   char szCard[64];
+   szCard[0] = 0;
+   const char* pCard = strstr(s_szHardwareAudioPlaybackDevice, "CARD=");
+   if ( NULL != pCard )
+   {
+      pCard += 5;
+      int j = 0;
+      while ( (0 != *pCard) && (*pCard != ',') && (j < (int)sizeof(szCard)-1) )
+         szCard[j++] = *pCard++;
+      szCard[j] = 0;
+   }
+   char szCardSel[80];
+   if ( 0 != szCard[0] )
+      snprintf(szCardSel, sizeof(szCardSel), "-c %s", szCard);
+   else
+      szCardSel[0] = 0;
+
+   char szArg[24];
+   if ( 0 == iDeltaPercent )
+      strcpy(szArg, "toggle");
+   else if ( iDeltaPercent > 0 )
+      snprintf(szArg, sizeof(szArg), "%d%%+", iDeltaPercent);
+   else
+      snprintf(szArg, sizeof(szArg), "%d%%-", -iDeltaPercent);
+
+   char szComm[320];
+   snprintf(szComm, sizeof(szComm),
+      "amixer %s -q set Master %s 2>/dev/null || amixer %s -q set PCM %s 2>/dev/null || amixer %s -q set Speaker %s 2>/dev/null",
+      szCardSel, szArg, szCardSel, szArg, szCardSel, szArg);
+   hw_execute_bash_command_nonblock(szComm, NULL);
+   log_line("[HardwareAudio] System volume: %s on card [%s]", szArg, (0 != szCard[0]) ? szCard : "default");
+}
+#endif
 
 int hardware_enable_audio_output()
 {
@@ -182,6 +270,11 @@ int hardware_audio_play_file(const char* szFile)
    snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q %s%s 2>/dev/null 1>/dev/null", szDevice, szFile);
    #endif
 
+   #if defined(HW_PLATFORM_X64)
+   if ( 0 != s_szHardwareAudioPlaybackDevice[0] )
+      snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q -D %s %s 2>/dev/null 1>/dev/null", s_szHardwareAudioPlaybackDevice, szFile);
+   #endif
+
    hw_execute_bash_command_timeout(szComm, NULL, 30000);
    return 0;
 }
@@ -205,7 +298,12 @@ void* _thread_audio_play_async(void *argument)
       strcpy(szDevice, "-D hw:CARD=rockchiphdmi0 ");
    snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q %s%s 2>/dev/null 1>/dev/null &", szDevice, s_szAudioFilePlayAsync);
    #endif
-   
+
+   #if defined(HW_PLATFORM_X64)
+   if ( 0 != s_szHardwareAudioPlaybackDevice[0] )
+      snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "aplay -q -D %s %s 2>/dev/null 1>/dev/null &", s_szHardwareAudioPlaybackDevice, s_szAudioFilePlayAsync);
+   #endif
+
    hw_execute_bash_command_nonblock(szComm, NULL);
    log_line("[HardwareAudio] Ended thread to play file async.");
    return NULL;

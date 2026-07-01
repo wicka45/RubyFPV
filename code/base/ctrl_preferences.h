@@ -147,6 +147,8 @@ typedef struct
    int iMSPOSDDeltaX; // delta chars
    int iMSPOSDDeltaY; // delta chars
    int iShowCompactMenus;
+   int iMenusTransparency; // 1 = transparent menu backgrounds (default), 0 = opaque (skips per-pixel blend -> much lower CPU on software-composited displays)
+   int iShowGSBattery; // ground-station battery OSD element (GS-wide, not per-vehicle); 0 = off (default)
 } Preferences;
 
 int save_Preferences();

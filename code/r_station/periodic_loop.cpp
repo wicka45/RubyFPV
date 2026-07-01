@@ -282,6 +282,39 @@ void _check_send_pairing_requests()
                send_alarm_to_central(ALARM_ID_GENERIC_STATUS_UPDATE, ALARM_FLAG_GENERIC_STATUS_SENT_PAIRING_REQUEST, PH.vehicle_id_dest);
          }
       }
+
+#if defined(HW_PLATFORM_X64)
+      // x64 libpcap TX may not reach the air unit; complete pairing when video link is clearly up.
+      int iX64VideoRxBps = (int)g_SM_RadioStats.radio_streams[i][STREAM_ID_VIDEO_1].rxBytesPerSec;
+      if ( iX64VideoRxBps <= 0 )
+         iX64VideoRxBps = (int)g_SM_RadioStats.radio_interfaces[0].rxBytesPerSec;
+      if ( iX64VideoRxBps <= 0 )
+         iX64VideoRxBps = g_SM_RadioStats.radio_interfaces[0].lastRecvDataRateVideo;
+      if ( ! g_State.vehiclesRuntimeInfo[i].bIsPairingDone )
+      if ( g_State.vehiclesRuntimeInfo[i].uPairingRequestId >= 20 )
+      if ( iX64VideoRxBps > 50000 )
+      {
+         log_line("x64: Auto-completing pairing with VID %u (video rx %d bps; no PAIRING_CONFIRMATION from vehicle)", pModel->uVehicleId, iX64VideoRxBps);
+         g_State.vehiclesRuntimeInfo[i].bIsPairingDone = true;
+
+         t_packet_header PHConfirm;
+         radio_packet_init(&PHConfirm, PACKET_COMPONENT_RUBY, PACKET_TYPE_RUBY_PAIRING_CONFIRMATION, STREAM_ID_DATA);
+         PHConfirm.vehicle_id_src = pModel->uVehicleId;
+         PHConfirm.vehicle_id_dest = g_uControllerId;
+         PHConfirm.total_length = sizeof(t_packet_header) + sizeof(u32) + sizeof(u16);
+
+         u16 uVersion = ((get_sw_version_major(pModel) & 0xFF) << 8) | (get_sw_version_minor(pModel) & 0xFF);
+         u8 packetConfirm[MAX_PACKET_TOTAL_SIZE];
+         memcpy(packetConfirm, (u8*)&PHConfirm, sizeof(t_packet_header));
+         memcpy(packetConfirm + sizeof(t_packet_header), &(g_State.vehiclesRuntimeInfo[i].uPairingRequestId), sizeof(u32));
+         memcpy(packetConfirm + sizeof(t_packet_header) + sizeof(u32), &uVersion, sizeof(u16));
+         radio_packet_compute_crc(packetConfirm, PHConfirm.total_length);
+
+         if ( -1 != g_fIPCToCentral )
+            ruby_ipc_channel_send_message(g_fIPCToCentral, packetConfirm, PHConfirm.total_length);
+         send_alarm_to_central(ALARM_ID_CONTROLLER_PAIRING_COMPLETED, pModel->uVehicleId, uVersion);
+      }
+#endif
    }
 }
 

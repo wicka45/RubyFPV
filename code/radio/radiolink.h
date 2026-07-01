@@ -89,6 +89,10 @@ void radio_close_interface_for_write(int interfaceIndex);
 u8* radio_process_wlan_data_in(int interfaceNumber, int* piOutPacketLength, int* piOutRxDatarate, u32 uTimeNow);
 int radio_get_last_read_error_code();
 
+#if defined(HW_PLATFORM_X64)
+void radio_reset_x64_rx_debug_stats(); // x64 RX pcap debug stats reset (defined in radiolink.c)
+#endif
+
 // returns 0 for failure, total length of packet for success
 int packet_process_and_check(int interfaceNb, u8* pPacketBuffer, int iBufferLength, int* pbCRCOk);
 int get_last_processing_error_code();

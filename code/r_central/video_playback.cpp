@@ -112,6 +112,22 @@ void video_playback_play_file(const char* szVideoInfoFile)
    if ( s_iMSPOSDCols > 64 )
       s_iMSPOSDCols = 64;
 
+   // From fix/radxa-dvr-playback-pacing (ce72f38): clamp bogus FPS metadata so
+   // playback isn't sped up / over-fast ("finishes quickly"). Keep in sync with that PR.
+   if ( (iFPS < 5) || (iFPS > 120) )
+   {
+      if ( (NULL != g_pCurrentModel) && (g_pCurrentModel->video_params.iVideoFPS >= 5) && (g_pCurrentModel->video_params.iVideoFPS <= 120) )
+         iFPS = g_pCurrentModel->video_params.iVideoFPS;
+      else
+         iFPS = 30;
+      log_softerror_and_alarm("VideoPlayback: Clamped invalid FPS from info file to %d", iFPS);
+   }
+   else if ( (NULL != g_pCurrentModel) && (g_pCurrentModel->video_params.iVideoFPS >= 5) && (iFPS > g_pCurrentModel->video_params.iVideoFPS + 10) )
+   {
+      log_softerror_and_alarm("VideoPlayback: FPS %d from info file is much higher than model FPS %d, using model FPS", iFPS, g_pCurrentModel->video_params.iVideoFPS);
+      iFPS = g_pCurrentModel->video_params.iVideoFPS;
+   }
+
    log_line("VideoPlayback: Read info file: wxh: %dx%d, type: %d, fc: %d, osd font: %d, cols/rows: %d/%d",
        iWidth, iHeight, iType, s_iMSPOSDFCType, s_iMSPOSDFontType, s_iMSPOSDCols, s_iMSPOSDRows);
    fclose(fd);
@@ -121,13 +137,13 @@ void video_playback_play_file(const char* szVideoInfoFile)
       send_control_message_to_router(PACKET_TYPE_LOCAL_CONTROL_PAUSE_LOCAL_VIDEO_DISPLAY, 1);
       hardware_sleep_ms(200);
    }  
-   #ifdef HW_PLATFORM_RASPBERRY
+   // All platforms (Pi/Radxa/x64) launch the same offline player command. This
+   // was previously #ifdef RASPBERRY/RADXA only, so on x64 szComm kept its prior
+   // "rm -rf <pausefile>" value -> the player never launched -> black playback.
    snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "./%s -file %s%s -fps %d", VIDEO_PLAYER_OFFLINE, FOLDER_MEDIA, szFile, iFPS);
-   #endif
-
-   #ifdef HW_PLATFORM_RADXA
-   snprintf(szComm, sizeof(szComm)/sizeof(szComm[0]), "./%s -file %s%s -fps %d", VIDEO_PLAYER_OFFLINE, FOLDER_MEDIA, szFile, iFPS);
-   #endif
+   // from fix/radxa-dvr-playback-pacing (ce72f38): tell the player the recorded codec.
+   if ( iType == VIDEO_TYPE_H265 )
+      strcat(szComm, " -h265");
 
    if ( g_pControllerSettings->iCoresAdjustment )
    {
@@ -346,6 +362,10 @@ void video_playback_periodic_loop()
    }
 }
 
+#if defined(HW_PLATFORM_X64)
+bool _central_blit_video_background();   // ruby_central.cpp: blits /RUBY_VIDEO_DISP as the video background
+#endif
+
 void video_playback_render()
 {
    if ( ! g_bIsVideoPlaying )
@@ -355,9 +375,22 @@ void video_playback_render()
 
    g_pRenderEngine->startFrame();
 
+#if defined(HW_PLATFORM_X64)
+   // x64 headless DVR playback: composite the decoded playback frame (offline ruby_player_x64 -file
+   // -> /RUBY_VIDEO_DISP) as the background, same as the live path. Without this the panel is black
+   // during playback (only the OSD overlay below was being drawn).
+   _central_blit_video_background();
+#endif
+
    double cColor[] = {0,0,0,0.7};
+#if ! defined(HW_PLATFORM_X64)
+   // x64 composites the video into the OSD buffer in software every frame; the alpha rounded-box
+   // background drawn over the frame is the per-frame cost that roughly halves playback fps (the OSD
+   // telemetry text keeps up at 60fps, so it's the box, not the text). Drop the box on x64 and keep the
+   // timer text below (its black outline keeps it readable on the video). Pi/Radxa keep the box.
    g_pRenderEngine->setColors(cColor, 0.9);
    g_pRenderEngine->drawRoundRect(0.02, 0.03, 0.36, 0.1, 0.02);
+#endif
    g_pRenderEngine->setColors(get_Color_MenuText());
 
    g_pRenderEngine->setFill(255,255,255,1);

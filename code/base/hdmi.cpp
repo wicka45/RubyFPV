@@ -6,15 +6,18 @@
 #include "hardware_procs.h"
 #include <errno.h>
 #include <unistd.h>
+#include <cstdio>
 #if defined(HW_PLATFORM_RADXA)
 #include <linux/videodev2.h>
 #include <rockchip/rk_mpi.h>
+#endif
 
+#if defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 extern "C" {
 #include <drm.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
-#include <drm_fourcc.h> 
+#include <drm_fourcc.h>
 }
 #endif
 
@@ -135,7 +138,7 @@ int _hdmi_detect_current_mode()
    return -1;
    #endif
 
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 
    // Mode[0] is always the current display mode
    s_nHDMI_CurrentResolutionIndex = 0;
@@ -143,7 +146,20 @@ int _hdmi_detect_current_mode()
 
    int fdDRM = -1;
 
-   fdDRM = open("/dev/dri/card0", O_RDWR | O_NONBLOCK);
+   const char* szDri = getenv("RUBY_DRI_CARD");
+   if ( szDri && szDri[0] )
+      fdDRM = open(szDri, O_RDWR | O_NONBLOCK);
+   else
+   {
+      for ( int card = 0; card < 8 && fdDRM < 0; card++ )
+      {
+         char szPath[64];
+         snprintf(szPath, sizeof(szPath), "/dev/dri/card%d", card);
+         if ( access(szPath, R_OK | W_OK) != 0 )
+            continue;
+         fdDRM = open(szPath, O_RDWR | O_NONBLOCK);
+      }
+   }
    if ( fdDRM < 0 )
    {
       log_softerror_and_alarm("[HDMI] Failed to open graphics device.");
@@ -187,11 +203,7 @@ int _hdmi_detect_current_mode()
          continue;
       }
       if ( pConnector->connection != DRM_MODE_CONNECTED )
-      {
-         drmModeFreeConnector(pConnector);
-         pConnector = NULL;
-         continue;
-      }
+         log_line("[HDMI] Connector %d not marked connected; using modes anyway", i);
       break;
    }
 
@@ -256,7 +268,7 @@ int hdmi_enum_modes()
    return 0;
    #endif
 
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    return _hdmi_detect_current_mode();
    #endif
 }
@@ -455,7 +467,7 @@ int hdmi_set_current_resolution(int width, int height, int refresh)
    hw_execute_bash_command("cp config.txt /boot/config.txt", NULL);
    #endif
 
-   #if defined (HW_PLATFORM_RADXA)
+   #if defined (HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
    char szFile[MAX_FILE_PATH_SIZE];
    strcpy(szFile, FOLDER_CONFIG);
    strcat(szFile, "hdmi_mode.cfg");

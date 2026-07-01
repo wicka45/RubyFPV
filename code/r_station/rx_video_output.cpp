@@ -152,9 +152,45 @@ u32 s_uOutputBitrateToLocalVideoPlayerUDP = 0;
 char s_szOutputVideoStreamerFilename[MAX_FILE_PATH_SIZE];
 int  s_iPIDVideoStreamer = -1;
 
+
+static void _rx_video_output_kill_stale_streamer_before_start()
+{
+   if ( 0 == s_szOutputVideoStreamerFilename[0] )
+      return;
+
+   char szPIDs[512];
+   szPIDs[0] = 0;
+   hw_process_get_pids(s_szOutputVideoStreamerFilename, szPIDs);
+   removeTrailingNewLines(szPIDs);
+   replaceNewLinesToSpaces(szPIDs);
+   if ( strlen(szPIDs) < 3 )
+   {
+      s_iPIDVideoStreamer = -1;
+      return;
+   }
+
+   bool bOnlyTrackedPid = false;
+   if ( s_iPIDVideoStreamer > 0 )
+   {
+      char szTracked[32];
+      snprintf(szTracked, sizeof(szTracked)/sizeof(szTracked[0]), "%d", s_iPIDVideoStreamer);
+      if ( 0 == strcmp(szPIDs, szTracked) )
+         bOnlyTrackedPid = true;
+   }
+
+   if ( bOnlyTrackedPid )
+      return;
+
+   log_line("[VideoOutput] Killing stale streamer process(es) [%s] before start (tracked PID %d)", szPIDs, s_iPIDVideoStreamer);
+   hw_stop_process(s_szOutputVideoStreamerFilename);
+   s_iPIDVideoStreamer = -1;
+}
+
 void rx_video_output_start_video_streamer()
 {
    log_line("[VideoOutput] Starting video streamer [%s]", s_szOutputVideoStreamerFilename);
+
+   _rx_video_output_kill_stale_streamer_before_start();
 
    if ( s_iPIDVideoStreamer > 0 )
    {
@@ -235,6 +271,23 @@ void rx_video_output_start_video_streamer()
       strcat(szStreamerParams, "-sm");
    #endif
 
+   #if defined(HW_PLATFORM_X64)
+   // x64: pass the real stream codec so the player picks the right decoder. H.265 -> -h265 (software
+   // avdec_h265; this GPU has no HEVC HW decode). H.264 -> no flag, so the player selects hardware
+   // vah264dec/vaapih264dec. Previously x64 passed NO codec (the -h265 logic above is Radxa-only),
+   // so the player defaulted to H.264 and H.265 streams rendered black -- which a -h265 -sw wrapper
+   // worked around. Passing the codec here lets us retire that wrapper and get HW H.264 decode.
+   if ( (NULL != g_pCurrentModel) && (g_pCurrentModel->video_params.uVideoExtraFlags & VIDEO_FLAG_GENERATE_H265) )
+   {
+      s_uCurrentReceivedVideoStreamType = VIDEO_TYPE_H265;
+      if ( 0 != szStreamerParams[0] )
+         strcat(szStreamerParams, " ");
+      strcat(szStreamerParams, "-h265");
+   }
+   else
+      s_uCurrentReceivedVideoStreamType = VIDEO_TYPE_H264;
+   #endif
+
    if ( 0 != szStreamerParams[0] )
       strcat(szStreamerParams, " ");
    strcat(szStreamerParams, "2>&1 1>/dev/null");
@@ -298,6 +351,23 @@ void rx_video_output_start_video_streamer()
       else
       {
          log_line("[VideoOutput] Opened shared mem for process watchdog for reading (%s).", SHARED_MEM_WATCHDOG_MPP_PLAYER);
+         break;
+      }
+      hardware_sleep_ms(50);
+      g_TimeNow = get_current_timestamp_ms();
+   }
+   #endif
+
+   #if defined(HW_PLATFORM_X64)
+   // Open the player's process-stats SHM (read) for the GS keep-up signal (appsrc backlog -> adaptive).
+   uTimeStart = g_TimeNow;
+   while ( g_TimeNow < uTimeStart + 2000 )
+   {
+      hardware_sleep_ms(20);
+      s_pSMProcessStatsMPPPlayer = shared_mem_process_stats_open_read(SHARED_MEM_WATCHDOG_MPP_PLAYER);
+      if ( NULL != s_pSMProcessStatsMPPPlayer )
+      {
+         log_line("[VideoOutput] Opened MPP player stats for GS keep-up signal (%s).", SHARED_MEM_WATCHDOG_MPP_PLAYER);
          break;
       }
       hardware_sleep_ms(50);
@@ -1409,12 +1479,81 @@ void _rx_video_output_watchdog_mpp_player()
       return;
 }
 
+#if defined(HW_PLATFORM_X64)
+static bool s_bGSDecodeBehind = false;
+static u32 s_uGSBehindSince = 0;
+static u32 s_uGSLastBehindMs = 0;
+static u32 s_uGSLastEvalMs = 0;
+static u32 s_uGSLastDecodedFrames = 0;   // last sampled decoded-frame count (player's uLoopCounter3)
+static u32 s_uGSLastFpsSampleMs = 0;
+// GS keep-up: detect when the x64 SOFTWARE decoder can't render in realtime, so the adaptive controller
+// can ease the ENCODE bitrate (less CABAC load lets it catch up). TWO signals, because the leaky appsrc
+// hides strain from either one alone:
+//   (a) appsrc backlog (uLoopCounter2, ms) -- pins high when the decode queue backs up.
+//   (b) render-FPS deficit -- the leaky queue DROPS frames to hold the backlog near 0, so a low backlog
+//       can still be choppy; compare the player's actual decoded-frame rate (uLoopCounter3) to the
+//       model's configured FPS -- a sustained shortfall = dropping frames = behind.
+// "Behind" if EITHER trips; "caught up" only when BOTH are clear (queue empty AND full FPS) so the
+// throttle settles at a genuinely SMOOTH rate, not just where the queue happens to drain.
+static void _rx_video_output_eval_gs_keepup()
+{
+   if ( NULL == s_pSMProcessStatsMPPPlayer ) return;
+   if ( g_TimeNow < s_uGSLastEvalMs + 1000 ) return;
+   u32 uDeltaMs = g_TimeNow - s_uGSLastEvalMs;
+   s_uGSLastEvalMs = g_TimeNow;
+
+   u32 uBacklogMs = s_pSMProcessStatsMPPPlayer->uLoopCounter2;
+
+   bool bFpsDeficit = false;
+   bool bFpsOk = true;   // default ok: never block caught-up when we cannot measure (no model / first pass)
+   u32 uFramesNow = s_pSMProcessStatsMPPPlayer->uLoopCounter3;
+   int iExpectedFPS = (NULL != g_pCurrentModel) ? g_pCurrentModel->video_params.iVideoFPS : 0;
+   if ( (iExpectedFPS > 0) && (0 != s_uGSLastFpsSampleMs) && (uDeltaMs > 0) && (uFramesNow >= s_uGSLastDecodedFrames) )
+   {
+      u32 uRenderedFPS = ((uFramesNow - s_uGSLastDecodedFrames) * 1000) / uDeltaMs;
+      bFpsDeficit = ( uRenderedFPS < (u32)((iExpectedFPS * 85) / 100) );   // dropping >15% -> behind
+      bFpsOk      = ( uRenderedFPS >= (u32)((iExpectedFPS * 92) / 100) );  // within ~8% -> smooth
+   }
+   s_uGSLastDecodedFrames = uFramesNow;
+   s_uGSLastFpsSampleMs = g_TimeNow;
+
+   // Render-FPS deficit DISABLED as a trigger: it compared decoded fps to the model's CONFIGURED fps, but the
+   // vehicle encodes fewer fps at a lower bitrate -> the signal tracked the very bitrate it controls -> a
+   // runaway collapse to the 0.5 Mbps floor (and bFpsOk never cleared, so it never recovered). Judge "behind"
+   // on the bitrate-stable appsrc BACKLOG only; it rises toward the leaky queue's max-time when the GS truly
+   // can't drain frames, and drains (self-limiting, no runaway) once the encode eases. FPS still sampled above
+   // for diagnostics only.
+   (void)bFpsDeficit; (void)bFpsOk;
+   bool bBehindNow = ( uBacklogMs >= 110 );
+   bool bClearNow  = ( uBacklogMs <= 60 );
+
+   if ( bBehindNow )
+   {
+      if ( 0 == s_uGSBehindSince ) s_uGSBehindSince = g_TimeNow;
+      if ( g_TimeNow >= s_uGSBehindSince + 2000 ) { s_bGSDecodeBehind = true; s_uGSLastBehindMs = g_TimeNow; }
+   }
+   else if ( bClearNow )
+   {
+      s_uGSBehindSince = 0;
+      s_bGSDecodeBehind = false;
+   }
+}
+bool rx_video_output_is_gs_decode_behind(u32* puLastBehindMs)
+{
+   if ( NULL != puLastBehindMs ) *puLastBehindMs = s_uGSLastBehindMs;
+   return s_bGSDecodeBehind;
+}
+#endif
+
 void rx_video_output_periodic_loop()
 {
    rx_video_recording_periodic_loop();
 
    #if defined(HW_PLATFORM_RADXA)
    _rx_video_output_watchdog_mpp_player();
+   #endif
+   #if defined(HW_PLATFORM_X64)
+   _rx_video_output_eval_gs_keepup();
    #endif
 
    if ( g_bDebugState )

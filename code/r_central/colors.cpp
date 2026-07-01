@@ -161,23 +161,55 @@ const double* get_Color_PopupText()
       return COLOR_POPUP_TEXT;
 }
 
+// When menu transparency is turned off (Controller Settings -> UI -> Menus), return an opaque copy of
+// the menu background color. Opaque fills take the fast 32-bit write path in the renderer instead of
+// the per-pixel alpha blend, which is a large CPU saving on software-composited displays (x64 GS).
+#if defined(HW_PLATFORM_X64)
+extern "C" int ruby_drm_core_is_gpu_composite();   // GPU (EGL/GLES2) composite active -> translucent menus are GPU-cheap
+#endif
+static const double* _menu_bg_maybe_opaque(const double* pBase, double* pStaticOut)
+{
+#if defined(HW_PLATFORM_X64)
+   // x64: with the GPU compositor (EGL/GLES2, the default on console + windowed) the OSD is a separate layer
+   // the GPU blends over the video, so a translucent menu bg is cheap -> honor the user's "Menu transparency"
+   // preference. Only the SOFTWARE fallback (cairo / dumb-buffer) blits video into this buffer, making a
+   // translucent menu a costly per-pixel CPU blend -> force opaque there.
+   if ( ! ruby_drm_core_is_gpu_composite() )
+   {
+      pStaticOut[0] = pBase[0];
+      pStaticOut[1] = pBase[1];
+      pStaticOut[2] = pBase[2];
+      pStaticOut[3] = 1.0;
+      return pStaticOut;
+   }
+#endif
+   if ( 0 != get_Preferences()->iMenusTransparency )
+      return pBase;
+   pStaticOut[0] = pBase[0];
+   pStaticOut[1] = pBase[1];
+   pStaticOut[2] = pBase[2];
+   pStaticOut[3] = 1.0;
+   return pStaticOut;
+}
+
 const double* get_Color_MenuBg()
 {
    Preferences* p = get_Preferences();
-   if ( p->iInvertColorsOSD )
-      return COLOR_MENU_INV_BG;
-   else
-      return COLOR_MENU_BG;
+   const double* pBase = p->iInvertColorsOSD ? COLOR_MENU_INV_BG : COLOR_MENU_BG;
+   static double s_MenuBgOpaque[4];
+   return _menu_bg_maybe_opaque(pBase, s_MenuBgOpaque);
 }
 
 const double* get_Color_MenuBgTitle()
 {
-   return COLOR_MENU_BG_TITLE; 
+   static double s_MenuBgTitleOpaque[4];
+   return _menu_bg_maybe_opaque(COLOR_MENU_BG_TITLE, s_MenuBgTitleOpaque);
 }
 
 const double* get_Color_MenuBgTooltip()
 {
-   return COLOR_MENU_BG_TOOLTIP; 
+   static double s_MenuBgTooltipOpaque[4];
+   return _menu_bg_maybe_opaque(COLOR_MENU_BG_TOOLTIP, s_MenuBgTooltipOpaque);
 }
 
 

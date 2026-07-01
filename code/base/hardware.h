@@ -52,6 +52,8 @@
 #define BOARD_TYPE_RADXA_3C 61
 #define BOARD_TYPE_RADXA_RUNCAM_VRX 62
 
+#define BOARD_TYPE_GENERIC_X86 70
+
 
 #define CAMERA_TYPE_NONE 0
 #define CAMERA_TYPE_CSI   1
@@ -168,6 +170,7 @@ int hardware_get_cpu_speed(); // in Mhz
 int hardware_get_gpu_speed(); // in Mhz
 
 int hardware_get_cpu_temp();
+int hardware_get_gs_battery_percent(); // ground-station battery 0..100, or -1 if none (e.g. laptop GS)
 
 void hardware_set_oipc_freq_boost(int iFreqCPUMhz, int iGPUBoost);
 void hardware_set_oipc_cpu_freq(int iFreqCPUMhz);

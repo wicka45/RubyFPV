@@ -31,11 +31,17 @@
 */
 
 #include "../base/base.h"
+#include "../base/config_hw.h"
 #include "../base/hardware.h"
 #include "../base/hardware_procs.h"
+#include "../base/hardware_audio.h"
 #include "../base/ctrl_settings.h"
 #include "keyboard.h"
 #include "timers.h"
+
+// from drm_core (renderer); forward-declared to avoid pulling libdrm headers into this translation unit
+extern "C" int ruby_drm_core_is_windowed();
+extern "C" int ruby_drm_core_poll_key(int* pCode, int* pPressed);
 #include <pthread.h>
 #include <errno.h>
 #include <linux/input.h>
@@ -44,7 +50,7 @@
 #include "warnings.h"
 
 #define MAX_INPUT_EVENTS 64
-#define MAX_INPUT_DEVICES 6
+#define MAX_INPUT_DEVICES 32
 
 bool s_bKeyboardInitDone = false;
 pthread_t s_pThreadKeyboard;
@@ -68,6 +74,7 @@ u32 s_uKeyboardInputEvents[MAX_INPUT_EVENTS];
 int s_iCountKeyboardInputEvents = 0;
 u32 s_uKeyboardInputEventsSum = 0;
 u32 s_uKeyboardLastQAActionEventTime = 0;
+u32 s_uKeyboardLastNavEventTime = 0;
 
 
 bool _input_device_has_key(int iFile, int iKey)
@@ -145,9 +152,8 @@ bool _keyboard_try_detect()
          continue;
       }
       if ( 0 != strcmp(s_InputDevicesInfo[i].szName, device_name) )
-      if ( ioctl(s_InputDevicesInfo[i].iFile, EVIOCGNAME(sizeof(device_name) - 1), &device_name) < 0 )
       {
-         log_line("[Keyboard] Input device index %d, name [%s] is no longer present or working. Closing it.", i, s_InputDevicesInfo[i].szName);
+         log_line("[Keyboard] Input device index %d, name changed [%s] -> [%s]. Closing it.", i, s_InputDevicesInfo[i].szName, device_name);
          _close_remove_input_device_info(i);
          continue;
       }
@@ -196,12 +202,19 @@ bool _keyboard_try_detect()
       if ( evbit & (1<<EV_KEY) )
         bHasKeyEvents = true;
 
+      #if defined(HW_PLATFORM_X64)
+      if ( ! _input_device_has_key(s_InputDevicesInfo[i].iFile, 103) )
+         bHasKeyEvents = false;
+      if ( ! _input_device_has_key(s_InputDevicesInfo[i].iFile, 106) )
+         bHasKeyEvents = false;
+      #else
       char ch = 'a';
       int asci = (int)ch;
       if ( ! _input_device_has_key(s_InputDevicesInfo[i].iFile, 32) )
          bHasKeyEvents = false;
       if ( ! _input_device_has_key(s_InputDevicesInfo[i].iFile, asci) )
          bHasKeyEvents = false;
+      #endif
 
       if ( ! bHasKeyEvents )
       {
@@ -276,6 +289,16 @@ void _add_input_event(u32 uEvent, bool bFromKeyboard)
       s_uKeyboardLastQAActionEventTime = get_current_timestamp_ms();
    }
 
+   if ( (uEvent == INPUT_EVENT_PRESS_MENU) ||
+        (uEvent == INPUT_EVENT_PRESS_BACK) ||
+        (uEvent == INPUT_EVENT_PRESS_MINUS) ||
+        (uEvent == INPUT_EVENT_PRESS_PLUS) )
+   {
+      if ( get_current_timestamp_ms() < s_uKeyboardLastNavEventTime + 150 )
+         return;
+      s_uKeyboardLastNavEventTime = get_current_timestamp_ms();
+   }
+
    //if ( uEvent == INPUT_EVENT_PRESS_MENU )
       log_line("[Input] Added input event %u %s, %d events already in queue", uEvent, bFromKeyboard?"from keyboard":"from GPIO", s_iCountKeyboardInputEvents);
    int iLock = pthread_mutex_lock(&s_pThreadKeyboardMutex);
@@ -292,8 +315,50 @@ void _add_input_event(u32 uEvent, bool bFromKeyboard)
          pthread_mutex_unlock(&s_pThreadKeyboardMutex);
 }
 
+#if defined(HW_PLATFORM_X64)
+// Map a pressed key (Linux evdev keycode) to a Ruby input event. Shared by the evdev path (DRM kiosk)
+// and the windowed X path. Volume keys drive the OS mixer and are consumed (not menu-navigation).
+static void _keyboard_process_pressed_code(int iCode)
+{
+   u32 uEvent = 0;
+   if ( iCode == 113 ) { hardware_audio_system_volume_step(0);  return; }
+   if ( iCode == 114 ) { hardware_audio_system_volume_step(-5); return; }
+   if ( iCode == 115 ) { hardware_audio_system_volume_step(5);  return; }
+   if ( iCode == 103 )                                        uEvent = INPUT_EVENT_PRESS_PLUS;
+   else if ( iCode == 108 )                                   uEvent = INPUT_EVENT_PRESS_MINUS;
+   else if ( iCode == 105 )                                   uEvent = INPUT_EVENT_PRESS_BACK;
+   else if ( iCode == 106 )                                   uEvent = INPUT_EVENT_PRESS_MINUS;
+   else if ( (iCode == 28) || (iCode == 57) || (iCode == 96) ) uEvent = INPUT_EVENT_PRESS_MENU;
+   else if ( (iCode == 14) || (iCode == 1) )                  uEvent = INPUT_EVENT_PRESS_BACK;
+   else if ( (iCode == 2) || (iCode == 79) )                  uEvent = INPUT_EVENT_PRESS_QA1;
+   else if ( (iCode == 3) )                                   uEvent = INPUT_EVENT_PRESS_QA2;
+   else if ( (iCode == 4) || (iCode == 81) )                  uEvent = INPUT_EVENT_PRESS_QA3;
+   else if ( iCode != 69 )
+   {
+      log_line("[Keyboard] Pressed unknown key %d", iCode);
+      uEvent = ((u32)iCode) << 16;
+   }
+   if ( uEvent > 0 )
+      _add_input_event(uEvent, true);
+}
+#endif
+
 int _read_keyboard_input_events()
 {
+#if defined(HW_PLATFORM_X64)
+   // Windowed mode: take keys from OUR X window (focus-respecting) via drm_core, NOT the global evdev
+   // read -- so we only get keys when focused and don't leak keys to/from other windows.
+   if ( ruby_drm_core_is_windowed() )
+   {
+      int iCode = 0, iPressed = 0;
+      while ( ruby_drm_core_poll_key(&iCode, &iPressed) )
+      {
+         if ( iPressed )
+            _keyboard_process_pressed_code(iCode);
+      }
+      return 0;
+   }
+#endif
    fd_set readset;
    int iMaxFD = 0;
    struct timeval tv;
@@ -341,13 +406,19 @@ int _read_keyboard_input_events()
 
       for( int k=0; k < iRead/(int)sizeof(struct input_event); k++)
       {
+         if ( events[k].type != EV_KEY )
+            continue;
+         if ( events[k].value == 0 )
+            continue;
          if ( events[k].value == 2 )
-            log_line("[Keyboard] Autorepeat key %d", events[k].code);
+            continue;
 
          if ( events[k].value == 1 )
          {
+#if defined(HW_PLATFORM_X64)
+            _keyboard_process_pressed_code(events[k].code);
+#else
             u32 uEvent = 0;
-
             if ( (events[k].code == 28) || (events[k].code == 57) || (events[k].code == 96) )
                uEvent = INPUT_EVENT_PRESS_MENU;
             else if ( (events[k].code == 14) || (events[k].code == 1) )
@@ -369,6 +440,7 @@ int _read_keyboard_input_events()
             }
             if ( uEvent > 0 )
                _add_input_event(uEvent, true);
+#endif
          }
       }
    }
@@ -390,6 +462,10 @@ static void * _thread_keyboard(void *argument)
       hardware_loop();
       if ( ! (*pbInitialized) )
          break;
+      // x64 desktop has no physical GPIO buttons; polling the (disabled, pin=-1)
+      // GPIO QA/long-press lines returns phantom "pressed" -> Quick Actions flashing.
+      // Guard ALL physical-button polling on x64 (matches MENU/BACK/+/- intent above).
+      #if !defined(HW_PLATFORM_X64)
       if ( isKeyMenuPressed() )
          _add_input_event(INPUT_EVENT_PRESS_MENU, false);
       if ( isKeyBackPressed() )
@@ -414,6 +490,9 @@ static void * _thread_keyboard(void *argument)
          s_bHasLongPressFlag = true;
       else
          s_bHasLongPressFlag = false;
+      #else
+      s_bHasLongPressFlag = false;
+      #endif
       hardware_sleep_ms(10);
 
       if ( ! (*pbInitialized) )

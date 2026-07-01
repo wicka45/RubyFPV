@@ -709,6 +709,15 @@ bool _check_update_first_pairing_done_if_needed(int iInterfaceIndex, u8* pPacket
    if ( g_bFirstModelPairingDone || g_bSearching || (NULL == pPacketData) )
       return true;
 
+   if ( (NULL != g_pCurrentModel) && g_pCurrentModel->is_spectator )
+      return true;
+
+   if ( (NULL != g_pCurrentModel) && (0 != g_pCurrentModel->uVehicleId) )
+   {
+      log_line("Router: skip auto first-pairing on RX (stored VID %u; complete pairing via Search/Spectator UI).", g_pCurrentModel->uVehicleId);
+      return true;
+   }
+
    t_packet_header* pPH = (t_packet_header*)pPacketData;
    if ( pPH->packet_type != PACKET_TYPE_RUBY_TELEMETRY_EXTENDED )
       return false;
@@ -946,23 +955,59 @@ void process_received_single_radio_packet(int iInterfaceIndex, u8* pData, int iD
       return;
    }
    
+   // x64: own injected TX of ANY type (RC, telemetry, commands, pings - not only pairing requests)
+   // is heard via monitor-mode loopback and carries vehicle_id_src == our controller id. The narrow
+   // pairing-only filter below misses these, so they reach the "unknown vehicle" path every uplink
+   // packet (~400ms), and each one runs a soft-error log + logCurrentVehiclesRuntimeInfo() that stalls
+   // the router loop and flaps the video stream. Drop ALL own-controller-id packets. Radxa/Pi never
+   // see own TX (kernel BPF/driver drops it before RX), so this is parity-safe, not a per-platform hack.
+   if ( (0 != g_uControllerId) && (uVehicleIdSrc == g_uControllerId) )
+      return;
+
+   // Monitor mode loopback: own pairing TX uses vehicle_id_src == controller id (not 0).
+   if ( (uPacketType == PACKET_TYPE_RUBY_PAIRING_REQUEST) && (NULL != g_pCurrentModel) )
+   if ( uVehicleIdDest == g_pCurrentModel->uVehicleId )
+   if ( uVehicleIdSrc == g_uControllerId )
+      return;
+
    if ( (0 == uVehicleIdSrc) || (MAX_U32 == uVehicleIdSrc) )
    {
+      // Promiscuous monitor mode hears our own pairing TX; ignore without alarming.
+      if ( (uPacketType == PACKET_TYPE_RUBY_PAIRING_REQUEST) && (uVehicleIdDest == g_pCurrentModel->uVehicleId) )
+      if ( (0 == uVehicleIdSrc) || (uVehicleIdSrc == g_uControllerId) )
+         return;
       log_softerror_and_alarm("Received invalid radio packet: Invalid source vehicle id: %u (vehicle id dest: %u, packet type: %s, %d bytes, %d total bytes, component: %d)",
          uVehicleIdSrc, uVehicleIdDest, str_get_packet_type(uPacketType), iDataLength, pPH->total_length, pPH->packet_flags & PACKET_FLAGS_MASK_MODULE);
       return;
    }
 
+   // Reserved local-control source id: signal_start_long_op() and similar set vehicle_id_src = 1
+   // (e.g. PACKET_TYPE_LOCAL_CONTROL_LONG_TASK) as a flag, not a real vehicle id. Such packets can
+   // reach the rx path; ignore them silently rather than treating them as an unknown vehicle (which
+   // would raise the "Unknown Vehicle Detected" dialog continuously). Like VID 0 / MAX_U32 above,
+   // VID 1 is never a real vehicle on any platform, so this is parity-safe - not a per-platform hack.
+   if ( 1 == uVehicleIdSrc )
+      return;
+
    static int s_iErrorCountInvalidModel = 0;
    Model* pModel = findModelWithId2(uVehicleIdSrc, 355, (s_iErrorCountInvalidModel<100)?true:false);
    if ( NULL == pModel )
    {
-      s_iErrorCountInvalidModel++;
-      if ( s_iErrorCountInvalidModel < 10 )
-         send_alarm_to_central(ALARM_ID_GENERIC, ALARM_ID_GENERIC_TYPE_UNKNOWN_VEHICLE, get_model_main_connect_frequency(g_pCurrentModel->uVehicleId));
+      // Startup grace window: right after boot, a vehicle's packets can arrive before its model is
+      // fully loaded/registered as current, briefly making findModelWithId2() return NULL. Don't raise
+      // the "Unknown Vehicle Detected" popup (or count toward the alarm budget) during this window -
+      // it is a boot-ordering race, not a genuine foreign vehicle. After the window, real unknown
+      // vehicles still alarm normally. The kernel-BPF (Pi/Radxa) builds don't see this because their
+      // model list is settled before RX; on x64 the timing is tighter.
+      if ( g_TimeNow > g_TimeStart + 5000 )
+      {
+         s_iErrorCountInvalidModel++;
+         if ( s_iErrorCountInvalidModel < 10 )
+            send_alarm_to_central(ALARM_ID_GENERIC, ALARM_ID_GENERIC_TYPE_UNKNOWN_VEHICLE, get_model_main_connect_frequency(g_pCurrentModel->uVehicleId));
 
-      log_softerror_and_alarm("Received radio packet from unknown vehicle while regular paired (not searching)");
-      logCurrentVehiclesRuntimeInfo();
+         log_softerror_and_alarm("Received radio packet from unknown vehicle while regular paired (not searching)");
+         logCurrentVehiclesRuntimeInfo();
+      }
       return;
    }
 

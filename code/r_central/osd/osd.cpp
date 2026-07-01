@@ -869,6 +869,47 @@ float _osd_show_rc_rssi(float xPos, float yPos, float fScale)
    return w;
 }
 
+// Ground-station battery (e.g. laptop GS). A GS-initiated OSD element (like RC RSSI), shown right-aligned.
+float _osd_show_gs_battery(float xPos, float yPos, float fScale)
+{
+   // The sysfs battery value changes slowly; cache it and refresh every few seconds.
+   static int s_iGSBatteryPercent = -2;
+   static u32 s_uTimeLastGSBatteryRead = 0;
+   if ( (s_iGSBatteryPercent == -2) || (g_TimeNow > s_uTimeLastGSBatteryRead + 5000) )
+   {
+      s_iGSBatteryPercent = hardware_get_gs_battery_percent();
+      s_uTimeLastGSBatteryRead = g_TimeNow;
+   }
+   if ( s_iGSBatteryPercent < 0 )
+      return 0.0;   // no GS battery present
+
+   char szBuff[32];
+   sprintf(szBuff, "GS Batt: %d%%", s_iGSBatteryPercent);
+
+   osd_set_colors();
+   // Low-battery warning: flash (alternate with the normal color every 500ms). Yellow at 20% or
+   // less, red at 10% or less. Above 20% it shows in the normal OSD color, no flashing.
+   if ( (s_iGSBatteryPercent <= 20) && ((g_TimeNow/500) % 2) )
+   {
+      if ( s_iGSBatteryPercent <= 10 )
+      {
+         double color[4] = {255,100,100,1.0};   // red
+         g_pRenderEngine->setColors(color);
+      }
+      else
+      {
+         double color[4] = {255,255,50,1.0};   // yellow
+         g_pRenderEngine->setColors(color);
+      }
+      g_pRenderEngine->setStroke(0,0,0,0.5);
+      g_pRenderEngine->setStrokeSize(OSD_STRIKE_WIDTH);
+   }
+   float w = g_pRenderEngine->textWidth(g_idFontOSDSmall, szBuff);
+   osd_show_value(xPos-w, yPos, szBuff, g_idFontOSDSmall);
+   osd_set_colors();
+   return w;
+}
+
 float osd_show_controller_voltage(float xPos, float yPos, bool bSmall)
 {
    float height_text = osd_getFontHeight();
@@ -1875,6 +1916,13 @@ void _render_osd_left_right()
       y += height_text + 1.0*vSpacing;
    }
 
+   // GS battery: a ground-station-wide element (controller preference, not per-vehicle), shown by RC RSSI.
+   if ( s_bDebugOSDShowAll || get_Preferences()->iShowGSBattery )
+   {
+      if ( _osd_show_gs_battery(x,y, 1.0) > 0.0 )
+         y += height_text + 1.0*vSpacing;
+   }
+
    if ( s_bDebugOSDShowAll || (pActiveModel->osd_params.osd_flags[osd_get_current_layout_index()] & OSD_FLAG_SHOW_RADIO_LINKS) || (g_pCurrentModel->osd_params.osd_flags[osd_get_current_layout_index()] & OSD_FLAG_SHOW_VEHICLE_RADIO_LINKS) )
    {
       for( int iVehicleRadioLink=g_pCurrentModel->radioLinksParams.links_count-1; iVehicleRadioLink >= 0; iVehicleRadioLink-- )
@@ -2255,6 +2303,14 @@ void osd_render_elements()
    if ( s_bDebugOSDShowAll || (pActiveModel->osd_params.osd_flags2[osd_get_current_layout_index()] & OSD_FLAG2_SHOW_RC_RSSI ) )
    {
       x -= _osd_show_rc_rssi(x,y, 1.0) + osd_getSpacingH();
+   }
+
+   // GS battery: ground-station-wide element (controller preference), shown next to RC RSSI.
+   if ( s_bDebugOSDShowAll || get_Preferences()->iShowGSBattery )
+   {
+      float fBattW = _osd_show_gs_battery(x,y, 1.0);
+      if ( fBattW > 0.0 )
+         x -= fBattW + osd_getSpacingH();
    }
 
    if ( s_bDebugOSDShowAll || (pActiveModel->osd_params.osd_flags[osd_get_current_layout_index()] & OSD_FLAG_SHOW_RADIO_LINKS) || (g_pCurrentModel->osd_params.osd_flags[osd_get_current_layout_index()] & OSD_FLAG_SHOW_VEHICLE_RADIO_LINKS) )

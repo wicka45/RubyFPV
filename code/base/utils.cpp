@@ -696,6 +696,45 @@ bool radio_utils_set_interface_frequency(Model* pModel, int iRadioIndex, int iAs
       }
       else if ( hardware_radio_is_wifi_radio(pRadioInfo) )
       {
+#if defined(HW_PLATFORM_X64)
+         // Modern Linux + Alfa/rtw88 in monitor mode: iwconfig (used by the generic path below) is
+         // deprecated and does NOT reliably set the monitor-mode frequency - it silently fails. That
+         // is why at normal startup the card never tuned to the vehicle's frequency and the GS could
+         // only connect via a manual Search (the search path already uses iw). Use iw here too, the
+         // same way the search path does, so the GS auto-reconnects on startup.
+         {
+            char szFreqCmd[160];
+            szOutput[0] = 0;
+            snprintf(szFreqCmd, sizeof(szFreqCmd)/sizeof(szFreqCmd[0]), "sudo -n iw dev %s set freq %u HT20 2>&1", pRadioInfo->szName, uFreqWifi);
+            hw_execute_bash_command(szFreqCmd, szOutput);
+            if ( strlen(szOutput) > 3 )
+            {
+               // The first set can race the interface coming up after a (re)config; retry once.
+               hardware_sleep_ms(delayMs);
+               szOutput[0] = 0;
+               hw_execute_bash_command(szFreqCmd, szOutput);
+            }
+            if ( (NULL != strstr(szOutput, "failed")) || (NULL != strstr(szOutput, "Invalid")) || (NULL != strstr(szOutput, "No such device")) || (NULL != strstr(szOutput, "not permitted")) )
+            {
+               for( int k=0; szOutput[k] != 0; k++ ) if ( szOutput[k]==10 || szOutput[k]==13 ) szOutput[k]='.';
+               log_softerror_and_alarm("Failed to set radio interface %d (%s) to %s via iw: [%s]", i+1, pRadioInfo->szName, str_format_frequency(uFrequencyKhz), szOutput);
+               pRadioInfo->lastFrequencySetFailed = 1;
+               pRadioInfo->uFailedFrequencyKhz = uFrequencyKhz;
+               pRadioInfo->uCurrentFrequencyKhz = 0;
+               failed = true;
+               if ( NULL != pProcessStats ) pProcessStats->lastActiveTime = get_current_timestamp_ms();
+               continue;
+            }
+            log_line("Set radio interface %d (%s) to frequency %s via iw (x64 normal path).", i+1, pRadioInfo->szName, str_format_frequency(uFrequencyKhz));
+            pRadioInfo->uCurrentFrequencyKhz = uFrequencyKhz;
+            pRadioInfo->lastFrequencySetFailed = 0;
+            pRadioInfo->uFailedFrequencyKhz = 0;
+            anySucceeded = true;
+            if ( NULL != pProcessStats ) pProcessStats->lastActiveTime = get_current_timestamp_ms();
+            hardware_sleep_ms((iRadioIndex != -1) ? (delayMs/2+1) : delayMs);
+            continue;
+         }
+#endif
          bool bTryHT40 = false;
          bool bUsedHT40 = false;
          szOutput[0] = 0;

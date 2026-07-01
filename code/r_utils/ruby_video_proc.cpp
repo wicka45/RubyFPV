@@ -185,8 +185,25 @@ bool store_video()
 
    str_sanitize_filename(vehicle_name);
 
+#if defined(HW_PLATFORM_X64)
+   // x64 GS has a real-time clock (RTC/NTP), so name recordings by wall-clock start time for easy
+   // browsing: video-<vehicle>-YYYY.MM.DD.hh.mm.ss.info  (seconds included so back-to-back
+   // recordings in the same minute don't collide). Pi/Radxa keep the boot-relative scheme below,
+   // since their clock is unreliable until NTP syncs. The media listing only checks the "video"
+   // prefix (menu_storage.cpp), and info/h265/osd/srt share this stem via extension-swap, so the
+   // format is otherwise free.
+   {
+      time_t tNow = time(NULL);
+      struct tm tmNow;
+      localtime_r(&tNow, &tmNow);
+      char szStamp[40];
+      strftime(szStamp, sizeof(szStamp), "%Y.%m.%d.%H.%M.%S", &tmNow);
+      snprintf(szOutFileInfo, sizeof(szOutFileInfo)/sizeof(szOutFileInfo[0]), "video-%s-%s.info", vehicle_name, szStamp);
+   }
+#else
    u32 timeNow = get_current_timestamp_ms();
    sprintf(szOutFileInfo, FILE_FORMAT_VIDEO_INFO, vehicle_name, g_iBootCount, (int)timeNow/1000, (int)timeNow%1000 );
+#endif
 
    strncpy(szOutFileVideo, szOutFileInfo, sizeof(szOutFileVideo)/sizeof(szOutFileVideo[0]));
    if ( iVideoType == VIDEO_TYPE_H265 )

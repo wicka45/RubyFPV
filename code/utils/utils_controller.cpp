@@ -42,7 +42,7 @@
 #include "../utils/utils_controller.h"
 #include "../utils/utils_vehicle.h"
 
-#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA)
+#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA) || defined(HW_PLATFORM_X64)
 
 u32 controller_utils_getControllerId()
 {
@@ -73,7 +73,11 @@ u32 controller_utils_getControllerId()
    uControllerId = rand();
    if ( BROADCAST_VEHICLE_ID == uControllerId )
       uControllerId = rand();
+#if defined(HW_PLATFORM_RASPBERRY) || defined(HW_PLATFORM_RADXA)
    fd = fopen("/sys/firmware/devicetree/base/serial-number", "r");
+#elif defined(HW_PLATFORM_X64)
+   fd = fopen("/etc/machine-id", "r");
+#endif
    if ( NULL != fd )
    {
       char szBuff[256];

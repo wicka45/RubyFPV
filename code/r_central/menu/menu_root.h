@@ -21,4 +21,5 @@ class MenuRoot: public Menu
       int m_iIndexSpectator, m_iIndexSearch;
       int m_iIndexController, m_iIndexMedia;
       int m_iIndexSystem;
+      int m_iIndexExitShell;
 };

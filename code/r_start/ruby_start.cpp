@@ -349,10 +349,21 @@ void _check_files()
       { failed = true; strcat(szFilesMissing, " "); strcat(szFilesMissing, VIDEO_PLAYER_OFFLINE); }
    #endif
 
+   #if defined(HW_PLATFORM_X64)
+   if( access( "ruby_rt_station", R_OK ) == -1 )
+      { failed = true; strcat(szFilesMissing, " ruby_rt_station"); }
+   if( access( "ruby_rx_telemetry", R_OK ) == -1 )
+      { failed = true; strcat(szFilesMissing, " ruby_rx_telemetry"); }
+   if( access( "ruby_video_proc", R_OK ) == -1 )
+      { failed = true; strcat(szFilesMissing, " ruby_video_proc"); }
+   if( access( "ruby_player_x64", R_OK ) == -1 )
+      { failed = true; strcat(szFilesMissing, " ruby_player_x64"); }
+   #else
    if( access( "ruby_rt_vehicle", R_OK ) == -1 )
       { failed = true; strcat(szFilesMissing, " ruby_rt_vehicle"); }
    if( access( "ruby_tx_telemetry", R_OK ) == -1 )
       { failed = true; strcat(szFilesMissing, " ruby_tx_telemetry"); }
+   #endif
 
    #ifdef HW_PLATFORM_RASPBERRY
    if ( access( "/etc/modprobe.d/ath9k_hw.conf.org", R_OK ) == -1 )
@@ -793,6 +804,21 @@ int _step_find_console()
    if ( (NULL != tty_name) && strcmp(tty_name, "/dev/pts/0") == 0 )
       foundGoodConsole = true;
 
+   #if defined(HW_PLATFORM_X64)
+   // x64: accept ANY controlling terminal (any /dev/ttyN or /dev/pts/N), or a graphical/VNC session.
+   // The tty1-only rule above is a DRM-kiosk heuristic (DRM master lives on the active VT); there's no
+   // reason to block x64, which runs windowed under DISPLAY/WAYLAND or from any console. If DRM can't
+   // take the VT it fails at DRM init, which is the right place to handle it -- not here.
+   if ( NULL != tty_name )
+      foundGoodConsole = true;
+   if ( (NULL != getenv("DISPLAY")) && (getenv("DISPLAY")[0] != 0) )
+      foundGoodConsole = true;
+   if ( NULL != getenv("WAYLAND_DISPLAY") )
+      foundGoodConsole = true;
+   if ( NULL != getenv("RUBY_GS_VNC") )
+      foundGoodConsole = true;
+   #endif
+
    #if defined (HW_PLATFORM_RASPBERRY)
    sprintf(szComm, "echo 'Ruby execute for Raspberry platform' >> /tmp/ruby_boot.log");
    hw_execute_bash_command_silent(szComm, NULL);
@@ -812,7 +838,7 @@ int _step_find_console()
    tty_name = szConsoleName;
    #endif
 
-   if ( (NULL == tty_name) || (!foundGoodConsole) )
+   if ( ! foundGoodConsole )
    {
       sprintf(szComm, "echo 'Ruby execute in wrong console. Abort.' >> /tmp/ruby_boot.log");
       hw_execute_bash_command_silent(szComm, NULL);
@@ -1401,6 +1427,16 @@ void _step_load_init_radios()
          log_line("wlan%d detected on the first try: [%s]", iWifiIndexToTry, szOutput);
          bWiFiDetected = true;
       }
+#if defined(HW_PLATFORM_X64)
+      // x64: the supported dongle may carry the predictable "wlx<MAC>" name instead of wlanN. Recognize
+      // it here so this module-load wait doesn't spin ~19s hunting for a wlan interface that never
+      // appears (the enumeration accepts wlx, but this earlier wait did not).
+      if ( (! bWiFiDetected) && (NULL != strstr(szOutput, "wlx")) )
+      {
+         log_line("[HW-R] x64: wireless dongle (wlx*) detected: [%s]", szOutput);
+         bWiFiDetected = true;
+      }
+#endif
 
       if ( bWiFiDetected )
          break;
@@ -1509,6 +1545,19 @@ int main(int argc, char *argv[])
    signal(SIGINT, handle_sigint);
    signal(SIGTERM, handle_sigint);
    signal(SIGQUIT, handle_sigint);
+
+#if defined(HW_PLATFORM_X64)
+   // Windowed GS: launched inside a graphical session, ruby_central renders into an X/XWayland window
+   // (auto-detected in drm_core). The video player must then stay HEADLESS -- feed decoded frames to
+   // ruby_central via shared mem so it composites into that ONE window, instead of opening its own
+   // video window. Force it here so every child process inherits it. RUBY_FORCE_DRM=1 keeps the whole
+   // stack on the DRM kiosk path even under a (possibly stray) DISPLAY.
+   if ( (NULL == getenv("RUBY_FORCE_DRM")) && ((NULL != getenv("DISPLAY")) || (NULL != getenv("WAYLAND_DISPLAY"))) )
+   {
+      setenv("RUBY_PLAYER_HEADLESS", "1", 1);
+      log_line("[RubyStart] Graphical session detected -> windowed GS (ruby_central in a window; player headless).");
+   }
+#endif
 
    char szFile[MAX_FILE_PATH_SIZE];
    char szComm[1204];
@@ -2146,6 +2195,13 @@ int main(int argc, char *argv[])
       hw_execute_ruby_process(NULL, "ruby_controller", NULL, NULL);
 
       #endif
+
+      #if defined(HW_PLATFORM_X64)
+      printf("Ruby: Starting controller...\n");
+      log_line("Starting controller...");
+      fflush(stdout);
+      hw_execute_ruby_process(NULL, "ruby_controller", NULL, NULL);
+      #endif
    }
 
    _log_oipc_boot_step("Done started processes.");
@@ -2237,7 +2293,7 @@ int main(int argc, char *argv[])
       {
          hardware_sleep_ms(2000);
          iRetryCounter--;
-         bool bAllOk = false;
+         bool bAllOk = true;
          if ( hw_process_exists("ruby_central") )
             log_line("ruby_central is started");
          else

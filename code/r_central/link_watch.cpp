@@ -822,6 +822,33 @@ void link_watch_loop_video()
    }
 }
 
+
+#if defined(HW_PLATFORM_X64)
+static bool _link_watch_x64_router_process_likely_busy()
+{
+   if ( ! hw_process_exists("ruby_rt_station") )
+      return false;
+
+   int iRadioIfCount = hardware_get_radio_interfaces_count();
+   if ( iRadioIfCount <= 0 )
+      iRadioIfCount = 1;
+   for ( int i=0; i<iRadioIfCount; i++ )
+   {
+      if ( (int)g_SM_RadioStats.radio_streams[i][STREAM_ID_VIDEO_1].rxBytesPerSec > 50000 )
+         return true;
+      if ( g_SM_RadioStats.radio_streams[i][STREAM_ID_VIDEO_1].timeLastRxPacket + 3000 > g_TimeNow )
+         return true;
+   }
+   if ( (int)g_SM_RadioStats.radio_interfaces[0].rxBytesPerSec > 50000 )
+      return true;
+   if ( g_SM_RadioStats.radio_interfaces[0].timeLastRxPacket + 3000 > g_TimeNow )
+      return true;
+   if ( (int)g_SM_RadioStats.radio_interfaces[0].lastRecvDataRateVideo > 50000 )
+      return true;
+   return false;
+}
+#endif
+
 void link_watch_loop_processes()
 {
    if ( g_bSearching || (g_TimeNow < s_TimeLastProcessesCheck + 2000) )
@@ -834,12 +861,26 @@ void link_watch_loop_processes()
    s_TimeLastProcessesCheck = g_TimeNow;
    char szOutput[4096];
 
-   if ( (NULL != g_pProcessStatsRouter) && (g_ProcessStatsRouter.lastActiveTime+1100 < g_TimeNow) )
+   u32 uRouterInactiveMs = 1100;
+   u32 uTelemetryInactiveMs = 1100;
+   int failureCountMax = 4;
+#if defined(HW_PLATFORM_X64)
+   uRouterInactiveMs = 20000;
+   uTelemetryInactiveMs = 5000;
+   failureCountMax = 8;
+#endif
+
+   bool bRouterProcessInactive = (NULL != g_pProcessStatsRouter) && (g_ProcessStatsRouter.lastActiveTime + uRouterInactiveMs < g_TimeNow);
+#if defined(HW_PLATFORM_X64)
+   if ( bRouterProcessInactive && _link_watch_x64_router_process_likely_busy() )
+      bRouterProcessInactive = false;
+#endif
+   if ( bRouterProcessInactive )
       s_CountProcessRouterFailures++;
    else
       s_CountProcessRouterFailures = 0;
 
-   if ( (NULL != g_pProcessStatsTelemetry) && (g_ProcessStatsTelemetry.lastActiveTime+1100 < g_TimeNow) )
+   if ( (NULL != g_pProcessStatsTelemetry) && (g_ProcessStatsTelemetry.lastActiveTime + uTelemetryInactiveMs < g_TimeNow) )
       s_CountProcessTelemetryFailures++;
    else
       s_CountProcessTelemetryFailures = 0;
@@ -858,7 +899,6 @@ void link_watch_loop_processes()
    }
 
    bool bNeedsRestart = false;
-   int failureCountMax = 4;
 
    if ( (int)s_CountProcessRouterFailures == failureCountMax )
    {

@@ -1120,6 +1120,9 @@ int main(int argc, char *argv[])
    shared_mem_radio_rx_queue_info_close(g_pSM_RadioRxQueueInfo);
    g_pSM_RadioRxQueueInfo = NULL;
    shared_mem_radio_stats_close(g_pSM_RadioStats);
+   g_pSM_RadioStats = NULL; // x64: must NULL after close; radio_links_close_rxtx_radio_interfaces()
+                            // later does memcpy((u8*)g_pSM_RadioStats,...) guarded only by != NULL
+                            // -> use-after-close write fault (the recurring wlan1 link reset).
    shared_mem_video_frames_stats_close(g_pSM_VideoFramesStatsOutput);
    //shared_mem_video_frames_stats_radio_in_close(g_pSM_VideoInfoStatsRadioIn);
    shared_mem_router_vehicles_runtime_info_close(g_pSM_RouterVehiclesRuntimeInfo);
@@ -1168,6 +1171,13 @@ void video_processors_init()
       #endif
       #ifdef HW_PLATFORM_RADXA
       //rx_video_output_enable_local_player_udp_output();
+      rx_video_output_enable_streamer_output();
+      #endif
+      #ifdef HW_PLATFORM_X64
+      // x64 port gap: enable the streamer output at cold start too (Pi/Radxa do, just above). Without
+      // this s_bEnableVideoStreamerOutput stays false -> received video is never written to the player
+      // -> BLACK until a vehicle codec toggle's restart path happens to enable it. Mirrors the enable
+      // the restart-streamer worker thread calls in rx_video_output.cpp.
       rx_video_output_enable_streamer_output();
       #endif
 

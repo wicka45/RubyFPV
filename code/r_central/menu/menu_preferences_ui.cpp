@@ -30,6 +30,7 @@
     SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include "../../base/hardware.h"
 #include "menu.h"
 #include "menu_preferences_ui.h"
 
@@ -40,6 +41,9 @@
 #include "../popup_log.h"
 #include "../fonts.h"
 
+#if defined(HW_PLATFORM_X64)
+extern "C" int ruby_drm_core_is_gpu_composite();   // GPU (EGL/GLES2) composite active -> translucent menus are GPU-cheap
+#endif
 
 MenuPreferencesUI::MenuPreferencesUI(bool bShowOnlyOSD)
 :Menu(MENU_ID_PREFERENCES_UI, L("Controller User Interface"), NULL)
@@ -76,6 +80,8 @@ void MenuPreferencesUI::addItems()
    m_IndexScaleMenu = -1;
    m_IndexMenuStacked = -1;
    m_IndexMenusCompact = -1;
+   m_IndexMenuTransparency = -1;
+   m_IndexGSBattery = -1;
 
    m_IndexUnits = -1;
    m_IndexUnitsHeight = -1;
@@ -116,7 +122,23 @@ void MenuPreferencesUI::addItems()
       m_pItemsSelect[9]->setIsEditable();
       m_IndexMenusCompact = addMenuItem(m_pItemsSelect[9]);
 
-      m_pItemsSelect[0] = new MenuItemSelect(L("Menu font size"), L("Change how big the menus appear on screen."));  
+      m_pItemsSelect[19] = new MenuItemSelect(L("Menu transparency"), L("Transparent menu backgrounds look nicer but cost extra CPU to blend over the video. Turn off for opaque menus and lower CPU/heat (recommended on low-power ground stations)."));
+      m_pItemsSelect[19]->addSelection(L("Off (opaque, faster)"));
+      m_pItemsSelect[19]->addSelection(L("On"));
+      m_pItemsSelect[19]->setIsEditable();
+      m_IndexMenuTransparency = addMenuItem(m_pItemsSelect[19]);
+#if defined(HW_PLATFORM_X64)
+      // x64: only the SOFTWARE fallback blits the live video into the OSD buffer, where a translucent menu is a
+      // costly per-pixel CPU blend -> lock it off + gray it out there. With the GPU compositor (the default), the
+      // OSD is a separate layer the GPU blends over the video, so transparency is cheap -> leave the toggle usable.
+      if ( ! ruby_drm_core_is_gpu_composite() )
+      {
+         m_pItemsSelect[19]->setSelectedIndex(0);
+         m_pItemsSelect[19]->setEnabled(false);
+      }
+#endif
+
+      m_pItemsSelect[0] = new MenuItemSelect(L("Menu font size"), L("Change how big the menus appear on screen."));
       m_pItemsSelect[0]->addSelection(L("X-Small"));
       m_pItemsSelect[0]->addSelection(L("Small"));
       m_pItemsSelect[0]->addSelection(L("Normal"));
@@ -124,7 +146,18 @@ void MenuPreferencesUI::addItems()
       m_pItemsSelect[0]->addSelection(L("X-Large"));
       m_pItemsSelect[0]->setIsEditable();
       m_IndexScaleMenu = addMenuItem(m_pItemsSelect[0]);
-      
+
+      // Ground-station-wide settings (apply across all vehicles). Only offered when the GS has a
+      // battery (e.g. laptop ground station); hidden on desktop/SBC ground stations.
+      if ( hardware_get_gs_battery_percent() >= 0 )
+      {
+         addMenuItem(new MenuItemSection(L("Ground Station")));
+         m_pItemsSelect[20] = new MenuItemSelect(L("GS battery in OSD"), L("Show the ground station battery level in the OSD, next to RC RSSI. Applies to all vehicles."));
+         m_pItemsSelect[20]->addSelection(L("No"));
+         m_pItemsSelect[20]->addSelection(L("Yes"));
+         m_pItemsSelect[20]->setIsEditable();
+         m_IndexGSBattery = addMenuItem(m_pItemsSelect[20]);
+      }
    }
 
    if ( m_bShowOnlyOSD )
@@ -311,6 +344,19 @@ void MenuPreferencesUI::valuesToUI()
          m_pItemsSelect[1]->setSelection(0);
 
       m_pItemsSelect[9]->setSelectedIndex(p->iShowCompactMenus);
+#if defined(HW_PLATFORM_X64)
+      if ( ! ruby_drm_core_is_gpu_composite() )   // software fallback: lock off + gray (see create above)
+      {
+         m_pItemsSelect[19]->setSelectedIndex(0);
+         m_pItemsSelect[19]->setEnabled(false);
+      }
+      else
+         m_pItemsSelect[19]->setSelectedIndex(p->iMenusTransparency?1:0);
+#else
+      m_pItemsSelect[19]->setSelectedIndex(p->iMenusTransparency?1:0);
+#endif
+      if ( -1 != m_IndexGSBattery )
+         m_pItemsSelect[20]->setSelectedIndex(p->iShowGSBattery?1:0);
    }
 
    if ( -1 != m_IndexInvertColors )
@@ -550,6 +596,23 @@ void MenuPreferencesUI::onSelectItem()
       p->iShowCompactMenus = m_pItemsSelect[9]->getSelectedIndex();
       save_Preferences();
       menu_invalidate_all();
+      return;
+   }
+
+   if ( ! m_bShowOnlyOSD )
+   if ( (-1 != m_IndexMenuTransparency) && (m_IndexMenuTransparency == m_SelectedIndex) )
+   {
+      p->iMenusTransparency = m_pItemsSelect[19]->getSelectedIndex();
+      save_Preferences();
+      menu_invalidate_all();
+      return;
+   }
+
+   if ( ! m_bShowOnlyOSD )
+   if ( (-1 != m_IndexGSBattery) && (m_IndexGSBattery == m_SelectedIndex) )
+   {
+      p->iShowGSBattery = m_pItemsSelect[20]->getSelectedIndex();
+      save_Preferences();
       return;
    }
 
